@@ -32,6 +32,19 @@ struct UIState {
     input_mode: Option<String>,
 }
 
+impl UIState {
+    fn reset_for_new_connection(&mut self) {
+        *self = Self::default();
+    }
+
+    fn note_candidate_state(&mut self, selection: i32) {
+        self.selection = Some(selection);
+        self.visible = Some(true);
+        // Candidate size affects edge-aware placement even when the caret rectangle does not.
+        self.position = None;
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Candidates {
     pub texts: Vec<String>,
@@ -97,20 +110,30 @@ impl IPCService {
             )),
         )?;
 
+        let ui_state = Arc::new(Mutex::new(UIState::default()));
+        let ui_state_for_connector = Arc::clone(&ui_state);
         let ui_channel = runtime.block_on(
             Endpoint::try_from("http://[::]:50052")?.connect_with_connector(service_fn(
-                |_| async {
-                    let client = loop {
-                        match ClientOptions::new().open(r"\\.\pipe\azookey_ui") {
-                            Ok(client) => break client,
-                            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
-                            Err(e) => return Err(e),
-                        }
+                move |_| {
+                    let ui_state = Arc::clone(&ui_state_for_connector);
+                    async move {
+                        let client = loop {
+                            match ClientOptions::new().open(r"\\.\pipe\azookey_ui") {
+                                Ok(client) => break client,
+                                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => (),
+                                Err(e) => return Err(e),
+                            }
 
-                        time::sleep(Duration::from_millis(50)).await;
-                    };
+                            time::sleep(Duration::from_millis(50)).await;
+                        };
 
-                    Ok::<_, std::io::Error>(TokioIo::new(client))
+                        ui_state
+                            .lock()
+                            .map_err(|error| std::io::Error::other(error.to_string()))?
+                            .reset_for_new_connection();
+
+                        Ok::<_, std::io::Error>(TokioIo::new(client))
+                    }
                 },
             )),
         )?;
@@ -123,7 +146,7 @@ impl IPCService {
             azookey_client,
             window_client,
             runtime: Arc::new(runtime),
-            ui_state: Arc::new(Mutex::new(UIState::default())),
+            ui_state,
         })
     }
 }
@@ -275,12 +298,7 @@ impl IPCService {
             .ui_state
             .lock()
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        state.selection = Some(selection);
-        state.visible = Some(true);
-        // Candidate size affects edge-aware placement even when the caret rectangle does not.
-        // The UI immediately repositions from its saved anchor; invalidating this cache also
-        // guarantees that the next TSF layout update re-sends the anchor.
-        state.position = None;
+        state.note_candidate_state(selection);
 
         Ok(())
     }
@@ -354,5 +372,39 @@ mod tests {
         assert_eq!(candidates.sub_texts, [""]);
         assert_eq!(candidates.corresponding_count, [5]);
         assert_eq!(candidates.raw_input.as_str(), "mihenkann");
+    }
+
+    #[test]
+    fn candidate_update_invalidates_the_position_cache() {
+        let mut state = UIState {
+            visible: Some(false),
+            position: Some((1, 2, 3, 4)),
+            selection: Some(0),
+            input_mode: Some("あ".to_owned()),
+        };
+
+        state.note_candidate_state(2);
+
+        assert_eq!(state.visible, Some(true));
+        assert_eq!(state.selection, Some(2));
+        assert_eq!(state.position, None);
+        assert_eq!(state.input_mode.as_deref(), Some("あ"));
+    }
+
+    #[test]
+    fn reconnect_clears_all_ui_deduplication_state() {
+        let mut state = UIState {
+            visible: Some(true),
+            position: Some((1, 2, 3, 4)),
+            selection: Some(2),
+            input_mode: Some("あ".to_owned()),
+        };
+
+        state.reset_for_new_connection();
+
+        assert!(state.visible.is_none());
+        assert!(state.position.is_none());
+        assert!(state.selection.is_none());
+        assert!(state.input_mode.is_none());
     }
 }

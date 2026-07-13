@@ -58,6 +58,13 @@ fn candidate_display_text(text: &str, sub_text: &str) -> String {
     display
 }
 
+fn displayed_utf16_count(preview: &str, suffix: &str) -> usize {
+    preview
+        .encode_utf16()
+        .count()
+        .saturating_add(suffix.encode_utf16().count())
+}
+
 fn snapshot_is_current(snapshot_generation: u64, current_generation: u64) -> bool {
     snapshot_generation == current_generation
 }
@@ -619,9 +626,7 @@ impl TextServiceFactory {
                     raw_hiragana = Arc::clone(&candidates.hiragana);
                 }
                 ClientAction::CommitPrefixAndAppend(text) => {
-                    let displayed_utf16_count =
-                        preview.encode_utf16().count() + suffix.encode_utf16().count();
-                    self.update_context(displayed_utf16_count, &preview)?;
+                    self.update_context(displayed_utf16_count(&preview, &suffix), &preview)?;
                     abort_if_reentered!();
 
                     let text = match mode {
@@ -706,8 +711,8 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_display_text, is_last_composing_character, snapshot_is_current, text_with_type,
-        SetTextType,
+        candidate_display_text, displayed_utf16_count, is_last_composing_character,
+        snapshot_is_current, text_with_type, SetTextType,
     };
 
     #[test]
@@ -748,6 +753,11 @@ mod tests {
     #[test]
     fn committed_prefix_replacement_keeps_the_new_suffix_visible() {
         assert_eq!(candidate_display_text("変換", "のこり"), "変換のこり");
+    }
+
+    #[test]
+    fn displayed_composition_count_uses_utf16_code_units() {
+        assert_eq!(displayed_utf16_count("変換😀", "後🚀"), 7);
     }
 
     #[test]
