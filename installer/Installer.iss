@@ -47,7 +47,7 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 [Files]
 Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit
 Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
-Source: "../build/*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "../build/*"; DestDir: "{app}"; Excludes: "azookey-setup.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "../target/{#BuildProfile}/bundle/nsis/Azookey_0.1.0_x64-setup.exe"; Flags: dontcopy noencryption
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 Source: "./SetupStartupTask.ps1"; Flags: dontcopy noencryption
@@ -95,6 +95,9 @@ var
   SetupScriptPath: string;
   Params: string;
   ResultCode: Integer;
+  Output: TExecOutput;
+  ErrorMessage: string;
+  I: Integer;
 begin
   ExtractTemporaryFile('Azookey Startup.xml');
   ExtractTemporaryFile('SetupStartupTask.ps1');
@@ -107,17 +110,24 @@ begin
     ' -LauncherPath "' + ExpandConstant('{app}\launcher.exe') + '"' +
     ' -TaskName "Azookey Startup"';
 
-  if not ShellExec('',
+  if not ExecAndCaptureOutput(
     ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     Params, '', SW_HIDE,
-    ewWaitUntilTerminated, ResultCode) then
+    ewWaitUntilTerminated, ResultCode, Output) then
   begin
     RaiseException('Failed to start the AzooKey startup-task setup helper.');
   end;
   if ResultCode <> 0 then
   begin
-    RaiseException(Format(
-      'AzooKey startup-task setup failed with exit code %d.', [ResultCode]));
+    ErrorMessage := Format(
+      'AzooKey startup-task setup failed with exit code %d.', [ResultCode]);
+    if Length(Output.StdErr) > 0 then
+      for I := 0 to Length(Output.StdErr) - 1 do
+        ErrorMessage := ErrorMessage + #13#10 + Output.StdErr[I];
+    if Length(Output.StdOut) > 0 then
+      for I := 0 to Length(Output.StdOut) - 1 do
+        ErrorMessage := ErrorMessage + #13#10 + Output.StdOut[I];
+    RaiseException(ErrorMessage);
   end;
 end;
 

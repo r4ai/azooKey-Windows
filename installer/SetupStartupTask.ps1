@@ -10,7 +10,9 @@ param(
     [string]$LauncherPath,
 
     [Parameter(Mandatory = $true)]
-    [string]$TaskName
+    [string]$TaskName,
+
+    [switch]$ValidateOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,8 +45,9 @@ try {
     $taskXml = [IO.File]::ReadAllText($TaskXmlTemplatePath, $utf8)
     if (-not $taskXml.Contains("CURRENT_USER_SID") -or
         -not $taskXml.Contains("PATH_TO_VBS") -or
-        -not $taskXml.Contains("PATH_TO_WSCRIPT")) {
-        throw "The startup task template is missing a required placeholder."
+        -not $taskXml.Contains("PATH_TO_WSCRIPT") -or
+        -not $taskXml.Contains('encoding="UTF-8"')) {
+        throw "The startup task template is missing a required placeholder or UTF-8 declaration."
     }
 
     $escapedLaunchPath = [Security.SecurityElement]::Escape('"' + $launchVbsFullPath + '"')
@@ -56,21 +59,49 @@ try {
     $taskXml = $taskXml.Replace("CURRENT_USER_SID", $identity.User.Value)
     $taskXml = $taskXml.Replace("PATH_TO_VBS", $escapedLaunchPath)
     $taskXml = $taskXml.Replace("PATH_TO_WSCRIPT", $escapedWscriptPath)
-    [IO.File]::WriteAllText($temporaryTaskXml, $taskXml, [Text.UTF8Encoding]::new($false))
 
-    $schtasks = Join-Path $env:WINDIR "System32\schtasks.exe"
-    & $schtasks /Create /F /TN $TaskName /XML $temporaryTaskXml
-    if ($LASTEXITCODE -ne 0) {
-        throw "schtasks /Create failed with exit code $LASTEXITCODE."
+    $taskXml = $taskXml.Replace('encoding="UTF-8"', 'encoding="UTF-16"')
+    [IO.File]::WriteAllText(
+        $temporaryTaskXml,
+        $taskXml,
+        [Text.UnicodeEncoding]::new($false, $true)
+    )
+
+    if ($ValidateOnly) {
+        $taskXmlBytes = [IO.File]::ReadAllBytes($temporaryTaskXml)
+        if ($taskXmlBytes.Length -lt 2 -or
+            $taskXmlBytes[0] -ne 0xFF -or
+            $taskXmlBytes[1] -ne 0xFE) {
+            throw "The generated startup task XML is not UTF-16 LE with a BOM."
+        }
+
+        $validatedTaskXml = [Xml.XmlDocument]::new()
+        $validatedTaskXml.PreserveWhitespace = $true
+        $validatedTaskXml.Load($temporaryTaskXml)
+
+        $scheduler = New-Object -ComObject "Schedule.Service"
+        $scheduler.Connect()
+        $definition = $scheduler.NewTask(0)
+        $definition.XmlText = $validatedTaskXml.OuterXml
     }
+    else {
+        $schtasks = Join-Path $env:WINDIR "System32\schtasks.exe"
+        & $schtasks /Create /F /TN $TaskName /XML $temporaryTaskXml
+        $createExitCode = $LASTEXITCODE
+        if ($createExitCode -ne 0) {
+            throw "schtasks /Create failed with exit code $createExitCode."
+        }
 
-    & $schtasks /Run /TN $TaskName
-    if ($LASTEXITCODE -ne 0) {
-        throw "schtasks /Run failed with exit code $LASTEXITCODE."
+        & $schtasks /Run /TN $TaskName
+        $runExitCode = $LASTEXITCODE
+        if ($runExitCode -ne 0) {
+            throw "schtasks /Run failed with exit code $runExitCode."
+        }
     }
 }
 catch {
-    Write-Error $_
+    $errorText = ($_ | Out-String).Trim()
+    [Console]::Error.WriteLine($errorText)
     exit 1
 }
 finally {

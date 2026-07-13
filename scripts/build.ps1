@@ -208,6 +208,25 @@ if (-not $isRelease) {
 }
 Invoke-Checked -FilePath $npm -ArgumentList $tauriArguments -WorkingDirectory $frontend
 
+$startupValidationVbs = Join-Path $repoRoot `
+    (".build-tools\startup-task-validation-{0}.vbs" -f [guid]::NewGuid().ToString("N"))
+try {
+    Invoke-Checked -FilePath (Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", (Join-Path $repoRoot "installer\SetupStartupTask.ps1"),
+            "-TaskXmlTemplatePath", (Join-Path $repoRoot "installer\Azookey Startup.xml"),
+            "-LaunchVbsPath", $startupValidationVbs,
+            "-LauncherPath", (Join-Path $repoRoot "target\$profile\launcher.exe"),
+            "-TaskName", "Azookey Startup Validation",
+            "-ValidateOnly"
+        )
+}
+finally {
+    Remove-Item -LiteralPath $startupValidationVbs -Force -ErrorAction SilentlyContinue
+}
+
 $env:AZOOKEY_PREVIOUS_BUILD = $null
 & (Join-Path $PSScriptRoot "stage-build.ps1") -KeepPreviousBuild @BuildArguments
 $previousBuild = $env:AZOOKEY_PREVIOUS_BUILD
