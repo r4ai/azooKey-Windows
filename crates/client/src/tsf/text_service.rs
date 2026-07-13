@@ -1,5 +1,5 @@
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     collections::HashMap,
     time::{Duration, Instant},
 };
@@ -43,6 +43,37 @@ pub enum UpdatePosState {
     SuppressingLayoutChange {
         until: Instant,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingInputModeTransition {
+    pub from: InputMode,
+    pub to: InputMode,
+}
+
+pub fn next_pending_input_mode_transition(
+    pending: Option<PendingInputModeTransition>,
+    previous_mode: InputMode,
+    next_mode: InputMode,
+    has_active_composition: bool,
+) -> Option<PendingInputModeTransition> {
+    if !has_active_composition || previous_mode == next_mode {
+        return if has_active_composition {
+            pending
+        } else {
+            None
+        };
+    }
+
+    let from = pending.map_or(previous_mode, |pending| pending.from);
+    if from == next_mode {
+        None
+    } else {
+        Some(PendingInputModeTransition {
+            from,
+            to: next_mode,
+        })
+    }
 }
 
 impl UpdatePosState {
@@ -89,12 +120,22 @@ impl UpdatePosState {
 pub struct TextService {
     pub tid: u32,
     pub thread_mgr: Option<ITfThreadMgr>,
+    pub dll_ref_held: bool,
+    pub key_event_sink_advised: bool,
+    pub thread_mgr_event_cookie: Option<u32>,
+    pub text_layout_context: Option<ITfContext>,
+    pub text_layout_cookie: Option<u32>,
+    pub lang_bar_added: bool,
     pub context: Option<ITfContext>,
     pub composition: RefCell<Composition>,
     pub update_pos_state: UpdatePosState,
     pub backspace_repeat_state: BackspaceRepeatState,
     pub display_attribute_atom: HashMap<GUID, u32>,
-    pub mode: InputMode,
+    pub mode: Cell<InputMode>,
+    pub open_close_cookie: Option<u32>,
+    pub conversion_mode_cookie: Option<u32>,
+    pub compartment_write_in_progress: bool,
+    pub pending_input_mode_transition: Cell<Option<PendingInputModeTransition>>,
     pub this: Option<ITfTextInputProcessor>,
 }
 
@@ -138,5 +179,39 @@ mod tests {
         assert!(!state.should_suppress(false, start + Duration::from_millis(1)));
         assert!(state.should_suppress(true, start + Duration::from_millis(79)));
         assert!(!state.should_suppress(true, start + Duration::from_millis(80)));
+    }
+
+    #[test]
+    fn pending_mode_transition_coalesces_to_the_latest_external_mode() {
+        let pending =
+            next_pending_input_mode_transition(None, InputMode::Kana, InputMode::Latin, true);
+        assert_eq!(
+            pending,
+            Some(PendingInputModeTransition {
+                from: InputMode::Kana,
+                to: InputMode::Latin,
+            })
+        );
+
+        assert_eq!(
+            next_pending_input_mode_transition(pending, InputMode::Latin, InputMode::Kana, true,),
+            None
+        );
+    }
+
+    #[test]
+    fn mode_change_without_a_composition_does_not_stay_pending() {
+        assert_eq!(
+            next_pending_input_mode_transition(
+                Some(PendingInputModeTransition {
+                    from: InputMode::Kana,
+                    to: InputMode::Latin,
+                }),
+                InputMode::Latin,
+                InputMode::Kana,
+                false,
+            ),
+            None
+        );
     }
 }

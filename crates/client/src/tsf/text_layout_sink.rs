@@ -8,9 +8,7 @@ use windows::{
 
 use anyhow::Result;
 
-use crate::engine::state::IMEState;
-
-use super::{factory::TextServiceFactory_Impl, text_service::TextService};
+use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
 impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
     // This function is called when the text display position changes when the IME is enabled.
@@ -45,40 +43,74 @@ impl ITfTextLayoutSink_Impl for TextServiceFactory_Impl {
     }
 }
 
-impl TextService {
-    pub fn advise_text_layout_sink(&mut self, doc_mgr: ITfDocumentMgr) -> Result<()> {
-        if IMEState::get()?.context.is_some() {
+impl TextServiceFactory {
+    pub fn advise_text_layout_sink(&self, doc_mgr: ITfDocumentMgr) -> Result<()> {
+        let has_existing_sink = {
+            let text_service = self.borrow()?;
+            text_service.text_layout_context.is_some() || text_service.text_layout_cookie.is_some()
+        };
+        if has_existing_sink {
             self.unadvise_text_layout_sink()?;
         }
 
-        unsafe {
-            let context = doc_mgr.GetTop()?;
+        let context = unsafe { doc_mgr.GetTop()? };
+        let sink = self.borrow()?.this::<ITfTextLayoutSink>()?;
+        let source = context.cast::<ITfSource>()?;
+        let cookie = unsafe { source.AdviseSink(&ITfTextLayoutSink::IID, &sink)? };
 
-            IMEState::get()?.context = Some(context.clone());
-
-            let cookie = context
-                .cast::<ITfSource>()?
-                .AdviseSink(&ITfTextLayoutSink::IID, &self.this::<ITfTextLayoutSink>()?)?;
-
-            IMEState::get()?
-                .cookies
-                .insert(ITfTextLayoutSink::IID, cookie);
-
+        let store_result = (|| -> Result<()> {
+            let mut text_service = self.borrow_mut()?;
+            text_service.text_layout_context = Some(context.clone());
+            text_service.text_layout_cookie = Some(cookie);
             Ok(())
-        }
-    }
+        })();
 
-    pub fn unadvise_text_layout_sink(&mut self) -> Result<()> {
-        unsafe {
-            let mut state = IMEState::get()?;
-
-            if let Some(context) = state.context.take() {
-                if let Some(cookie) = state.cookies.remove(&ITfTextLayoutSink::IID) {
-                    context.cast::<ITfSource>()?.UnadviseSink(cookie)?;
+        if let Err(error) = store_result {
+            if let Err(rollback_error) = unsafe { source.UnadviseSink(cookie) } {
+                tracing::warn!(
+                    "Failed to roll back text-layout sink registration: {rollback_error:?}"
+                );
+                if let Ok(mut text_service) = self.borrow_mut() {
+                    text_service.text_layout_context = Some(context);
+                    text_service.text_layout_cookie = Some(cookie);
                 }
             }
-
-            Ok(())
+            return Err(error);
         }
+
+        Ok(())
+    }
+
+    pub fn unadvise_text_layout_sink(&self) -> Result<()> {
+        let (context, cookie) = {
+            let text_service = self.borrow()?;
+            (
+                text_service.text_layout_context.clone(),
+                text_service.text_layout_cookie,
+            )
+        };
+
+        let (context, cookie) = match (context, cookie) {
+            (None, None) => return Ok(()),
+            (Some(_), None) => {
+                self.borrow_mut()?.text_layout_context = None;
+                return Ok(());
+            }
+            (None, Some(_)) => anyhow::bail!("Text-layout sink cookie has no context"),
+            (Some(context), Some(cookie)) => (context, cookie),
+        };
+        unsafe { context.cast::<ITfSource>()?.UnadviseSink(cookie)? };
+
+        // Preserve the context/cookie until UnadviseSink succeeds so Deactivate can retry a
+        // failed teardown with the original source.
+        {
+            let mut text_service = self.borrow_mut()?;
+            if text_service.text_layout_cookie == Some(cookie) {
+                text_service.text_layout_cookie = None;
+                text_service.text_layout_context = None;
+            }
+        }
+
+        Ok(())
     }
 }

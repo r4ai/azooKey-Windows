@@ -69,6 +69,20 @@ fn snapshot_is_current(snapshot_generation: u64, current_generation: u64) -> boo
     snapshot_generation == current_generation
 }
 
+fn input_mode_transition(
+    state: CompositionState,
+    current_mode: InputMode,
+    requested_mode: InputMode,
+) -> (CompositionState, Vec<ClientAction>) {
+    let next_state = if current_mode == requested_mode {
+        state
+    } else {
+        CompositionState::None
+    };
+
+    (next_state, vec![ClientAction::SetIMEMode(requested_mode)])
+}
+
 #[derive(Default, Debug)]
 pub struct Composition {
     // These strings are snapshotted while synchronous RPC/TSF calls run. Arc keeps that
@@ -127,6 +141,7 @@ impl TextServiceFactory {
             composition.tip_composition = None;
             composition.generation = composition.generation.wrapping_add(1);
         }
+        self.borrow()?.pending_input_mode_transition.set(None);
 
         let ipc_service = match IMEState::get() {
             Ok(state) => state.ipc_service.clone(),
@@ -149,6 +164,38 @@ impl TextServiceFactory {
         Ok(())
     }
 
+    pub fn has_pending_input_mode_transition(&self) -> Result<bool> {
+        Ok(self.borrow()?.pending_input_mode_transition.get().is_some())
+    }
+
+    /// Applies an external TSF mode transition at the first real key-processing safe point.
+    /// OnChange cannot request an edit session because compartment callbacks may be synchronous
+    /// with SetValue. By waiting until OnKeyDown, the composition can be ended before this same
+    /// key is classified again under the new mode.
+    fn finish_pending_input_mode_transition(&self) -> Result<bool> {
+        let pending = self.borrow()?.pending_input_mode_transition.get();
+        if pending.is_none() {
+            return Ok(false);
+        }
+
+        let tip_exists = {
+            let text_service = self.borrow()?;
+            let tip_exists = text_service.borrow_composition()?.tip_composition.is_some();
+            tip_exists
+        };
+        if tip_exists {
+            self.end_composition()?;
+        }
+
+        // EndComposition normally invokes OnCompositionTerminated synchronously. If a host does
+        // not invoke it, perform the same idempotent server/UI and local-state cleanup here.
+        if self.has_pending_input_mode_transition()? {
+            self.handle_composition_terminated()?;
+        }
+
+        Ok(true)
+    }
+
     #[tracing::instrument]
     pub fn process_key(
         &self,
@@ -167,7 +214,7 @@ impl TextServiceFactory {
         let (composition_state, is_last_input, suffix_is_empty, mode) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?;
-            let mode = IMEState::get()?.input_mode.clone();
+            let mode = text_service.mode.get();
             (
                 composition.state,
                 is_last_composing_character(&composition.raw_hiragana),
@@ -177,6 +224,33 @@ impl TextServiceFactory {
         };
 
         let action = UserAction::try_from(wparam.0)?;
+
+        // Activation is intentionally allowed to complete without IPC so the TIP remains
+        // selectable during launcher/server startup races. Until a background reconnect has
+        // succeeded, only mode keys are consumed; ordinary text must reach the host unchanged.
+        let ipc_available = IMEState::ipc_available_or_start_reconnect();
+        if !ipc_available
+            && !matches!(
+                &action,
+                UserAction::SetInputMode(_) | UserAction::ToggleInputMode
+            )
+        {
+            return Ok(None);
+        }
+
+        // Mode commands are valid in every composition state, including candidate selection.
+        // Handling them before the state-specific key table also keeps F3/F4 explicitly
+        // idempotent instead of treating both as a blind toggle.
+        let requested_mode = match &action {
+            UserAction::SetInputMode(requested_mode) => Some(*requested_mode),
+            UserAction::ToggleInputMode => Some(mode.toggled()),
+            _ => None,
+        };
+        if let Some(requested_mode) = requested_mode {
+            let (transition, actions) =
+                input_mode_transition(composition_state, mode, requested_mode);
+            return Ok(Some((actions, transition)));
+        }
 
         let (transition, actions) = match composition_state {
             CompositionState::None => match action {
@@ -193,13 +267,6 @@ impl TextServiceFactory {
                         ClientAction::StartComposition,
                         ClientAction::AppendText(number.to_string()),
                     ],
-                ),
-                UserAction::ToggleInputMode => (
-                    CompositionState::None,
-                    vec![match mode {
-                        InputMode::Kana => ClientAction::SetIMEMode(InputMode::Latin),
-                        InputMode::Latin => ClientAction::SetIMEMode(InputMode::Kana),
-                    }],
                 ),
                 _ => {
                     return Ok(None);
@@ -256,13 +323,6 @@ impl TextServiceFactory {
                         vec![ClientAction::SetSelection(SetSelectionType::Down)],
                     ),
                 },
-                UserAction::ToggleInputMode => (
-                    CompositionState::None,
-                    vec![
-                        ClientAction::EndComposition,
-                        ClientAction::SetIMEMode(InputMode::Latin),
-                    ],
-                ),
                 UserAction::Space | UserAction::Tab => (
                     CompositionState::Previewing,
                     vec![ClientAction::SetSelection(SetSelectionType::Down)],
@@ -344,13 +404,6 @@ impl TextServiceFactory {
                         vec![ClientAction::SetSelection(SetSelectionType::Down)],
                     ),
                 },
-                UserAction::ToggleInputMode => (
-                    CompositionState::None,
-                    vec![
-                        ClientAction::EndComposition,
-                        ClientAction::SetIMEMode(InputMode::Latin),
-                    ],
-                ),
                 UserAction::Space | UserAction::Tab => (
                     CompositionState::Previewing,
                     vec![ClientAction::SetSelection(SetSelectionType::Down)],
@@ -397,6 +450,30 @@ impl TextServiceFactory {
             return Ok(false);
         };
 
+        if let Err(error) = self.finish_pending_input_mode_transition() {
+            // OnTestKeyDown deliberately claimed this key to reach this safe point. Returning
+            // not-eaten lets the host handle it and preserves the pending transition for retry.
+            tracing::warn!("Failed to finish pending input-mode transition: {error:?}");
+            return Ok(false);
+        }
+
+        // A reconnect creates a fresh UI channel whose deduplication cache is empty. Synchronize
+        // the per-TextService mode immediately before the first handled key, without making UI
+        // availability a prerequisite for TSF mode keys.
+        let mode = self.borrow()?.mode.get();
+        let ipc_service = match IMEState::get() {
+            Ok(state) => state.ipc_service.clone(),
+            Err(error) => {
+                tracing::warn!("Failed to read IPC state before key handling: {error:?}");
+                None
+            }
+        };
+        if let Some(mut ipc_service) = ipc_service {
+            if let Err(error) = ipc_service.set_input_mode(mode.indicator()) {
+                tracing::warn!("Failed to synchronize candidate UI input mode: {error:?}");
+            }
+        }
+
         if let Some((actions, transition)) = self.process_key(context, wparam)? {
             self.handle_action(&actions, transition)?;
         } else {
@@ -421,11 +498,11 @@ impl TextServiceFactory {
             mut candidates,
             mut selection_index,
             mut generation,
-            mode,
+            mut mode,
         ) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?;
-            let mode = IMEState::get()?.input_mode.clone();
+            let mode = text_service.mode.get();
             (
                 Arc::clone(&composition.preview),
                 Arc::clone(&composition.suffix),
@@ -438,20 +515,30 @@ impl TextServiceFactory {
                 mode,
             )
         };
-        let mut ipc_service = IMEState::get()?
-            .ipc_service
-            .clone()
-            .context("ipc_service is None")?;
+        let mut ipc_service = match IMEState::get() {
+            Ok(state) => state.ipc_service.clone(),
+            Err(error) => {
+                tracing::warn!("Failed to read optional IPC service: {error:?}");
+                None
+            }
+        };
         let mut transition = transition;
+        macro_rules! require_ipc_service {
+            () => {
+                ipc_service.as_mut().context("ipc_service is None")?
+            };
+        }
         macro_rules! abort_if_reentered {
             () => {
                 if !snapshot_is_current(generation, self.composition_generation()?) {
                     tracing::warn!("Discard stale composition action after TSF re-entry");
-                    if let Err(error) = ipc_service.hide_window() {
-                        tracing::warn!("Failed to hide window after TSF re-entry: {error:?}");
-                    }
-                    if let Err(error) = ipc_service.clear_text() {
-                        tracing::warn!("Failed to clear server after TSF re-entry: {error:?}");
+                    if let Some(ipc_service) = ipc_service.as_mut() {
+                        if let Err(error) = ipc_service.hide_window() {
+                            tracing::warn!("Failed to hide window after TSF re-entry: {error:?}");
+                        }
+                        if let Err(error) = ipc_service.clear_text() {
+                            tracing::warn!("Failed to clear server after TSF re-entry: {error:?}");
+                        }
                     }
                     return Ok(());
                 }
@@ -483,8 +570,10 @@ impl TextServiceFactory {
                     raw_input = Arc::default();
                     raw_hiragana = Arc::default();
                     candidates = Arc::default();
-                    ipc_service.hide_window()?;
-                    ipc_service.clear_text()?;
+                    if let Some(ipc_service) = ipc_service.as_mut() {
+                        ipc_service.hide_window()?;
+                        ipc_service.clear_text()?;
+                    }
                 }
                 ClientAction::DiscardComposition => {
                     // Clearing the TSF range before ending commits an empty string. In
@@ -501,8 +590,10 @@ impl TextServiceFactory {
                     raw_input = Arc::default();
                     raw_hiragana = Arc::default();
                     candidates = Arc::default();
-                    ipc_service.hide_window()?;
-                    ipc_service.clear_text()?;
+                    if let Some(ipc_service) = ipc_service.as_mut() {
+                        ipc_service.hide_window()?;
+                        ipc_service.clear_text()?;
+                    }
                 }
                 ClientAction::AppendText(text) => {
                     let text = match mode {
@@ -510,7 +601,7 @@ impl TextServiceFactory {
                         InputMode::Latin => text.to_string(),
                     };
 
-                    candidates = Arc::new(ipc_service.append_text(text)?);
+                    candidates = Arc::new(require_ipc_service!().append_text(text)?);
                     selection_index = 0;
                     let text = candidates
                         .texts
@@ -532,10 +623,11 @@ impl TextServiceFactory {
                     raw_input = Arc::clone(&candidates.raw_input);
                     raw_hiragana = Arc::clone(&candidates.hiragana);
 
-                    ipc_service.set_candidate_state(&candidates.texts, selection_index)?;
+                    require_ipc_service!()
+                        .set_candidate_state(&candidates.texts, selection_index)?;
                 }
                 ClientAction::RemoveText => {
-                    candidates = Arc::new(ipc_service.remove_text()?);
+                    candidates = Arc::new(require_ipc_service!().remove_text()?);
                     selection_index = 0;
                     let text = candidates.texts.first().map(String::as_str).unwrap_or("");
                     let sub_text = candidates
@@ -552,45 +644,54 @@ impl TextServiceFactory {
                     raw_input = Arc::clone(&candidates.raw_input);
                     raw_hiragana = Arc::clone(&candidates.hiragana);
 
-                    ipc_service.set_candidate_state(&candidates.texts, selection_index)?;
+                    require_ipc_service!()
+                        .set_candidate_state(&candidates.texts, selection_index)?;
                 }
                 ClientAction::MoveCursor(_offset) => {
                     // TODO: I'll use azookey-kkc's composingText
                     // self.set_cursor(offset)?;
                 }
-                ClientAction::SetIMEMode(mode) => {
+                ClientAction::SetIMEMode(requested_mode) => {
+                    let requested_change = mode != *requested_mode;
                     let tip_exists = {
                         let text_service = self.borrow()?;
                         let tip_exists =
                             text_service.borrow_composition()?.tip_composition.is_some();
                         tip_exists
                     };
-                    if tip_exists {
+                    if requested_change && tip_exists {
                         self.end_composition()?;
                         generation = self.composition_generation()?;
                     }
 
-                    let mut ime_state = IMEState::get()?;
-                    ime_state.input_mode = mode.clone();
+                    let previous_mode = mode;
+                    let actual_mode = self.set_input_mode_compartments(*requested_mode)?;
+                    mode = actual_mode;
 
-                    // update the language bar
-                    self.update_lang_bar()?;
+                    // UI is optional. apply_input_mode already attempted this notification, but
+                    // keep the action-local clone in sync too; IPCService deduplicates it.
+                    if let Some(ipc_service) = ipc_service.as_mut() {
+                        if let Err(error) = ipc_service.set_input_mode(actual_mode.indicator()) {
+                            tracing::warn!("Failed to update candidate UI input mode: {error:?}");
+                        }
+                    }
 
-                    let mode = match mode {
-                        InputMode::Latin => "A",
-                        InputMode::Kana => "あ",
-                    };
-
-                    ipc_service.set_input_mode(mode)?;
-
-                    selection_index = 0;
-                    corresponding_count = 0;
-                    preview = Arc::default();
-                    suffix = Arc::default();
-                    raw_input = Arc::default();
-                    raw_hiragana = Arc::default();
-                    candidates = Arc::default();
-                    ipc_service.clear_text()?;
+                    if requested_change || previous_mode != actual_mode {
+                        selection_index = 0;
+                        corresponding_count = 0;
+                        preview = Arc::default();
+                        suffix = Arc::default();
+                        raw_input = Arc::default();
+                        raw_hiragana = Arc::default();
+                        candidates = Arc::default();
+                        if let Some(ipc_service) = ipc_service.as_mut() {
+                            if let Err(error) = ipc_service.clear_text() {
+                                tracing::warn!(
+                                    "Failed to clear server after input-mode change: {error:?}"
+                                );
+                            }
+                        }
+                    }
                 }
                 ClientAction::SetSelection(selection) => {
                     selection_index = match selection {
@@ -618,7 +719,7 @@ impl TextServiceFactory {
                         .get(index)
                         .context("candidate corresponding_count selection is out of range")?;
 
-                    ipc_service.set_selection(selection_index)?;
+                    require_ipc_service!().set_selection(selection_index)?;
                     self.set_text(text, sub_text)?;
                     abort_if_reentered!();
                     preview = Arc::new(text.clone());
@@ -633,8 +734,10 @@ impl TextServiceFactory {
                         InputMode::Kana => to_fullwidth(text, false),
                         InputMode::Latin => text.to_string(),
                     };
-                    candidates =
-                        Arc::new(ipc_service.commit_prefix_and_append(corresponding_count, text)?);
+                    candidates = Arc::new(
+                        require_ipc_service!()
+                            .commit_prefix_and_append(corresponding_count, text)?,
+                    );
                     selection_index = 0;
 
                     let text = candidates
@@ -658,7 +761,8 @@ impl TextServiceFactory {
                     raw_input = Arc::clone(&candidates.raw_input);
                     raw_hiragana = Arc::clone(&candidates.hiragana);
 
-                    ipc_service.set_candidate_state(&candidates.texts, selection_index)?;
+                    require_ipc_service!()
+                        .set_candidate_state(&candidates.texts, selection_index)?;
                     self.update_pos()?;
                     abort_if_reentered!();
 
@@ -685,11 +789,13 @@ impl TextServiceFactory {
             drop(composition);
             drop(text_service);
             tracing::warn!("Discard stale composition writeback after TSF re-entry");
-            if let Err(error) = ipc_service.hide_window() {
-                tracing::warn!("Failed to hide window after stale writeback: {error:?}");
-            }
-            if let Err(error) = ipc_service.clear_text() {
-                tracing::warn!("Failed to clear server after stale writeback: {error:?}");
+            if let Some(ipc_service) = ipc_service.as_mut() {
+                if let Err(error) = ipc_service.hide_window() {
+                    tracing::warn!("Failed to hide window after stale writeback: {error:?}");
+                }
+                if let Err(error) = ipc_service.clear_text() {
+                    tracing::warn!("Failed to clear server after stale writeback: {error:?}");
+                }
             }
             return Ok(());
         }
@@ -711,8 +817,9 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_display_text, displayed_utf16_count, is_last_composing_character,
-        snapshot_is_current, text_with_type, SetTextType,
+        candidate_display_text, displayed_utf16_count, input_mode_transition,
+        is_last_composing_character, snapshot_is_current, text_with_type, ClientAction,
+        CompositionState, InputMode, SetTextType,
     };
 
     #[test]
@@ -765,5 +872,29 @@ mod tests {
         assert!(snapshot_is_current(7, 7));
         assert!(!snapshot_is_current(7, 8));
         assert!(!snapshot_is_current(u64::MAX, 0));
+    }
+
+    #[test]
+    fn changing_input_mode_ends_the_composition_state() {
+        let (state, actions) = input_mode_transition(
+            CompositionState::Composing,
+            InputMode::Kana,
+            InputMode::Latin,
+        );
+
+        assert_eq!(state, CompositionState::None);
+        assert_eq!(actions, [ClientAction::SetIMEMode(InputMode::Latin)]);
+    }
+
+    #[test]
+    fn requesting_the_current_input_mode_preserves_composition_state() {
+        let (state, actions) = input_mode_transition(
+            CompositionState::Composing,
+            InputMode::Kana,
+            InputMode::Kana,
+        );
+
+        assert_eq!(state, CompositionState::Composing);
+        assert_eq!(actions, [ClientAction::SetIMEMode(InputMode::Kana)]);
     }
 }

@@ -24,6 +24,10 @@ fn is_backspace(wparam: WPARAM) -> bool {
     wparam.0 == VK_BACK.0 as usize
 }
 
+fn should_claim_pending_transition(has_context: bool, has_pending_transition: bool) -> bool {
+    has_context && has_pending_transition
+}
+
 // sink (aka event listener) for key events
 impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
@@ -43,6 +47,14 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
             // Claim queued auto-repeat events even if the previous event ended the
             // composition. Otherwise the host application can receive the backlog and
             // unexpectedly delete committed text.
+            return Ok(true.into());
+        }
+
+        // External compartment changes are finalized only from the real OnKeyDown safe point.
+        // Claim one test event so handle_key can end the old composition and then classify this
+        // same key again under the new mode.
+        if should_claim_pending_transition(pic.is_some(), self.has_pending_input_mode_transition()?)
+        {
             return Ok(true.into());
         }
 
@@ -117,5 +129,12 @@ mod tests {
         assert!(!is_key_repeat(LPARAM(0)));
         assert!(!is_key_repeat(LPARAM(1)));
         assert!(is_key_repeat(LPARAM(PREVIOUS_KEY_STATE_BIT as isize)));
+    }
+
+    #[test]
+    fn pending_transition_is_claimed_before_ipc_key_classification() {
+        assert!(should_claim_pending_transition(true, true));
+        assert!(!should_claim_pending_transition(true, false));
+        assert!(!should_claim_pending_transition(false, true));
     }
 }

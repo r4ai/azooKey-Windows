@@ -2,6 +2,8 @@ use crate::extension::VKeyExt;
 use anyhow::{Context, Result};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, ToUnicode, VK_SHIFT};
 
+use super::input_mode::InputMode;
+
 #[derive(Debug)]
 pub enum UserAction {
     Input(char),
@@ -14,6 +16,7 @@ pub enum UserAction {
     Navigation(Navigation),
     Function(Function),
     Number(i8),
+    SetInputMode(InputMode),
     ToggleInputMode,
 }
 
@@ -71,7 +74,11 @@ impl TryFrom<usize> for UserAction {
             0x78 => UserAction::Function(Function::Nine), // VK_F9
             0x79 => UserAction::Function(Function::Ten), // VK_F10
 
-            0xF3 | 0xF4 => UserAction::ToggleInputMode, // Zenkaku/Hankaku
+            0x16 => UserAction::SetInputMode(InputMode::Kana), // VK_IME_ON
+            0x19 => UserAction::ToggleInputMode,               // VK_KANJI
+            0x1A => UserAction::SetInputMode(InputMode::Latin), // VK_IME_OFF
+            0xF3 => UserAction::SetInputMode(InputMode::Latin), // VK_DBE_SBCSCHAR
+            0xF4 => UserAction::SetInputMode(InputMode::Kana), // VK_DBE_DBCSCHAR
 
             _ => {
                 let key_state = {
@@ -96,5 +103,34 @@ impl TryFrom<usize> for UserAction {
         };
 
         Ok(action)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dbcs_and_sbcs_keys_request_explicit_modes() {
+        assert!(matches!(
+            UserAction::try_from(0xF3).unwrap(),
+            UserAction::SetInputMode(InputMode::Latin)
+        ));
+        assert!(matches!(
+            UserAction::try_from(0xF4).unwrap(),
+            UserAction::SetInputMode(InputMode::Kana)
+        ));
+    }
+
+    #[test]
+    fn ime_on_and_off_keys_request_explicit_modes() {
+        assert!(matches!(
+            UserAction::try_from(0x16).unwrap(),
+            UserAction::SetInputMode(InputMode::Kana)
+        ));
+        assert!(matches!(
+            UserAction::try_from(0x1A).unwrap(),
+            UserAction::SetInputMode(InputMode::Latin)
+        ));
     }
 }

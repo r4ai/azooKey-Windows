@@ -23,11 +23,15 @@ impl ITfThreadMgrEventSink_Impl for TextServiceFactory_Impl {
         focus: Option<&ITfDocumentMgr>,
         _prevfocus: Option<&ITfDocumentMgr>,
     ) -> Result<()> {
-        self.update_lang_bar()?;
+        if let Err(error) = self.update_lang_bar() {
+            tracing::warn!("Failed to refresh language-bar item after focus change: {error:?}");
+        }
 
         // if focus is changed, the text layout sink should be updated
         if let Some(focus) = focus {
-            self.borrow_mut()?.advise_text_layout_sink(focus.clone())?;
+            if let Err(error) = self.advise_text_layout_sink(focus.clone()) {
+                tracing::warn!("Failed to move text-layout sink to focused document: {error:?}");
+            }
         }
 
         let actions = vec![ClientAction::EndComposition];
