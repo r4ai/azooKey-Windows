@@ -20,17 +20,13 @@ jobs:
     - name: Install Swift
       uses: compnerd/gha-setup-swift@main
       with:
-        branch: swift-6.0.2-release
-        tag: 6.0.2-RELEASE
+        swift-version: swift-6.1.3-release
+        swift-build: 6.1.3-RELEASE
+        update-sdk-modules: true
 
-    - name: Fix swift sdk
-      shell: pwsh
-      run: |
-        $SwiftPath = "$env:APPDATA\..\Local\Programs\Swift\Platforms\6.0.2\Windows.platform\Developer\SDKs\Windows.sdk\usr"
-        $modulemapUrl = "https://gist.githubusercontent.com/fkunn1326/ef8be2217082302b291f2b8d4178194a/raw/c424968c250afcd5afa1131aea1329dc0744a7f9/ucrt.modulemap"
-        $destination = "$SwiftPath\share\ucrt.modulemap"
-        Invoke-WebRequest -Uri $modulemapUrl -OutFile $destination
-    
+    - name: Set up MSVC developer environment
+      uses: compnerd/gha-setup-vsdevenv@f1ba60d553a3216ce1b89abe0201213536bc7557 # v6
+
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
 
@@ -51,6 +47,11 @@ jobs:
           Remove-Item $tempZip
         }
 
+        # AzooKeyKanaKanjiConverter v0.11.2 imports the b4846 C ABI. Keep all
+        # runtime backends and the import library on that exact release.
+        $llamaVersion = "b4846"
+        $llamaReleaseBase = "https://github.com/fkunn1326/llama.cpp/releases/download/$llamaVersion"
+
         # Create directories
         $llamaCpuDir = "llama_cpu"
         $llamaCudaDir = "llama_cuda"
@@ -58,9 +59,9 @@ jobs:
         New-Item -Path $llamaCpuDir, $llamaCudaDir, $llamaVulkanDir -ItemType Directory -Force
 
         # Download and extract files
-        Download-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-avx-x64.zip" -destFolder $llamaCpuDir
-        Download-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-cuda-cu12.4-x64.zip" -destFolder $llamaCudaDir
-        Download-Extract -url "https://github.com/fkunn1326/llama.cpp/releases/download/b4846/llama-b4846-bin-win-vulkan-x64.zip" -destFolder $llamaVulkanDir
+        Download-Extract -url "$llamaReleaseBase/llama-$llamaVersion-bin-win-avx-x64.zip" -destFolder $llamaCpuDir
+        Download-Extract -url "$llamaReleaseBase/llama-$llamaVersion-bin-win-cuda-cu12.4-x64.zip" -destFolder $llamaCudaDir
+        Download-Extract -url "$llamaReleaseBase/llama-$llamaVersion-bin-win-vulkan-x64.zip" -destFolder $llamaVulkanDir
 
         # Copy llama.lib to server-swift
         Copy-Item "$llamaCpuDir\llama.lib" -Destination "server-swift\" -Force
@@ -69,6 +70,14 @@ jobs:
         $zenzUrl = "https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
         $zenzDest = "zenz.gguf"
         Invoke-WebRequest -Uri $zenzUrl -OutFile $zenzDest
+
+    - name: Resolve and patch Zenzai inference dependency
+      shell: pwsh
+      run: |
+        Push-Location server-swift
+        swift package resolve
+        Pop-Location
+        & .\scripts\patch-kkc.ps1 -PackagePath .\server-swift
 
     - name: Install node dependencies
       run: |

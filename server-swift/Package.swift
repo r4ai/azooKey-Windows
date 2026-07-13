@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -15,9 +15,13 @@ let package = Package(
         .library(name: "ffi", targets: ["azookey-server"])
     ],
     dependencies: [
-        // Dependencies declare other packages that this package depends on.
-        // .package(url: /* package url */, from: "1.0.0"),
-        .package(url: "https://github.com/azookey/AzooKeyKanaKanjiConverter", branch: "7d5dd99")
+        // scripts/patch-kkc.ps1 verifies this exact source before applying the
+        // Windows GPU-offload and context-safety patch used by the build.
+        .package(
+            url: "https://github.com/azookey/AzooKeyKanaKanjiConverter",
+            exact: "0.11.2",
+            traits: ["Zenzai"]
+        )
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -28,11 +32,17 @@ let package = Package(
             dependencies: [
                 .product(name: "KanaKanjiConverterModule", package: "azookeykanakanjiconverter"),
                 "ffi"
+            ],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx)
             ]
         ),
         .testTarget(
             name: "azookey-serverTests",
-            dependencies: ["azookey-server"]
+            dependencies: ["azookey-server"],
+            swiftSettings: [
+                .interoperabilityMode(.Cxx)
+            ]
         ),
     ]
 )

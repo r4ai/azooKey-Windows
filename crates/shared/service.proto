@@ -12,6 +12,7 @@ message Suggestion {
 message ComposingText {
   string hiragana = 1; // The main text content.
   repeated Suggestion suggestions = 2; // List of suggestions for the text.
+  string raw_input = 3; // Remaining raw key input (for example, romanized kana input).
 }
 
 // Request message for AppendText.
@@ -46,6 +47,17 @@ message ShrinkTextResponse {
     ComposingText composing_text = 1; // The resulting text and suggestions.
 }
 
+// Atomically commits the selected prefix and appends new input. This avoids
+// running conversion once for ShrinkText and again for AppendText.
+message CommitPrefixAndAppendRequest {
+  int32 offset = 1;
+  string text_to_append = 2;
+}
+
+message CommitPrefixAndAppendResponse {
+  ComposingText composing_text = 1;
+}
+
 // Response message for MoveCursor.
 message MoveCursorResponse {
   ComposingText composing_text = 1; // The resulting text and suggestions.
@@ -72,6 +84,7 @@ service AzookeyService {
   rpc AppendText (AppendTextRequest) returns (AppendTextResponse);
   rpc RemoveText (RemoveTextRequest) returns (RemoveTextResponse);
   rpc ShrinkText (ShrinkTextRequest) returns (ShrinkTextResponse);
+  rpc CommitPrefixAndAppend (CommitPrefixAndAppendRequest) returns (CommitPrefixAndAppendResponse);
   rpc MoveCursor (MoveCursorRequest) returns (MoveCursorResponse);
   rpc ClearText (ClearTextRequest) returns (ClearTextResponse);
   rpc SetContext (SetContextRequest) returns (SetContextResponse);

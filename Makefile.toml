@@ -11,8 +11,10 @@ description = "Build the swift code"
 script_runner = "@shell"
 script = """
 cd server-swift
-swift build -c release
-cp .build/release/azookey-server.lib ../
+swift package resolve
+powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/patch-kkc.ps1 -PackagePath .
+swift build -c release --disable-automatic-resolution
+cp .build/x86_64-unknown-windows-msvc/release/azookey-server.lib ../
 """
 
 [tasks.build_x64]

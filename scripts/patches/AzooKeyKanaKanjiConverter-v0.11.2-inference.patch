@@ -1,0 +1,47 @@
+diff --git a/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzContext.swift b/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzContext.swift
+index d268f9a..34bc2c9 100644
+--- a/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzContext.swift
++++ b/Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zenz/ZenzContext.swift
+@@ -80,2 +79,0 @@ final class ZenzContext {
+-    private let n_len: Int32 = 512
+-
+@@ -98 +96 @@ final class ZenzContext {
+-        ctx_params.n_ctx = 512
++        ctx_params.n_ctx = 1024
+@@ -101 +99 @@ final class ZenzContext {
+-        ctx_params.n_batch = 512
++        ctx_params.n_batch = 1024
+@@ -109 +107,6 @@ final class ZenzContext {
+-        #if ZenzaiCPU
++        #if Zenzai
++        // The b4846 default is zero outside Metal. Offload every model layer
++        // explicitly so Vulkan/CUDA do not fall back to the slow hybrid path.
++        model_params.n_gpu_layers = Int32.max
++        model_params.split_mode = LLAMA_SPLIT_MODE_LAYER
++        #elseif ZenzaiCPU
+@@ -121 +124,3 @@ final class ZenzContext {
+-        #if ZenzaiCPU
++        #if Zenzai
++        params.offload_kqv = true
++        #elseif ZenzaiCPU
+@@ -143 +148,3 @@ final class ZenzContext {
+-        #if ZenzaiCPU
++        #if Zenzai
++        params.offload_kqv = true
++        #elseif ZenzaiCPU
+@@ -156,0 +164,5 @@ final class ZenzContext {
++        let nCtx = Int(llama_n_ctx(context))
++        guard tokens.count <= nCtx else {
++            debug("error: token count exceeds the context size", tokens.count, nCtx)
++            return nil
++        }
+@@ -169 +181,2 @@ final class ZenzContext {
+-        var batch = llama_batch_init(512, 0, 1)
++        let decodeTokenCount = tokens.count - prefixCacheCount
++        var batch = llama_batch_init(Int32(max(1, decodeTokenCount)), 0, 1)
+@@ -171,5 +183,0 @@ final class ZenzContext {
+-        let n_ctx = llama_n_ctx(context)
+-        let n_kv_req = tokens.count + (Int(n_len) - tokens.count)
+-        if n_kv_req > n_ctx {
+-            debug("error: n_kv_req > n_ctx, the required KV cache size is not big enough")
+-        }

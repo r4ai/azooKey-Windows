@@ -2,64 +2,128 @@ import KanaKanjiConverterModule
 import Foundation
 import ffi
 
-@MainActor let converter = KanaKanjiConverter()
-@MainActor var composingText = ComposingText()
+private let ffiSuccess: Int32 = 0
+private let ffiInvalidArgument: Int32 = 1
 
-@MainActor var execURL = URL(filePath: "")
-@MainActor var config: [String : Any] = [
-    "enable": false,
-    "profile": "",
-]
+private struct ServerConfiguration: Equatable {
+    var enableZenzai = false
+    var profile = ""
+    var context = ""
+}
 
-@MainActor func getOptions(context: String = "") -> ConvertRequestOptions {
-    return ConvertRequestOptions(
+private struct CandidatePayload {
+    var text: String
+    var subtext: String
+    var correspondingCount: Int32
+}
+
+@MainActor private var converter: KanaKanjiConverter?
+@MainActor private var composingText = ComposingText()
+@MainActor private var executableURL: URL?
+@MainActor private var configuration = ServerConfiguration()
+@MainActor private var zenzaiAllowed = true
+@MainActor private var cachedTextReplacer: TextReplacer?
+@MainActor private var cachedOptions: ConvertRequestOptions?
+@MainActor private var cachedOptionsConfiguration: ServerConfiguration?
+
+@MainActor
+private func requestOptions() -> ConvertRequestOptions? {
+    guard let executableURL else {
+        return nil
+    }
+    if let cachedOptions, cachedOptionsConfiguration == configuration {
+        return cachedOptions
+    }
+
+    let zenzaiMode: ConvertRequestOptions.ZenzaiMode
+    if zenzaiAllowed && configuration.enableZenzai {
+        zenzaiMode = .on(
+            weight: executableURL.appendingPathComponent("zenz.gguf"),
+            inferenceLimit: 1,
+            requestRichCandidates: false,
+            personalizationMode: nil,
+            versionDependentMode: .v3(
+                .init(
+                    profile: configuration.profile,
+                    leftSideContext: configuration.context
+                )
+            )
+        )
+    } else {
+        zenzaiMode = .off
+    }
+
+    let options = ConvertRequestOptions(
         requireJapanesePrediction: true,
         requireEnglishPrediction: false,
         keyboardLanguage: .ja_JP,
         learningType: .nothing,
-        dictionaryResourceURL: execURL.appendingPathComponent("Dictionary"),
         memoryDirectoryURL: URL(filePath: "./test"),
         sharedContainerURL: URL(filePath: "./test"),
-        textReplacer: .init {
-            return execURL.appendingPathComponent("EmojiDictionary").appendingPathComponent("emoji_all_E15.1.txt")
-        },
-        // zenzai
-        zenzaiMode: config["enable"] as! Bool ? .on(
-            weight: execURL.appendingPathComponent("zenz.gguf"),
-            inferenceLimit: 1,
-            requestRichCandidates: true,
-            personalizationMode: nil,
-            versionDependentMode: .v3(
-                .init(
-                    profile: config["profile"] as! String,
-                    leftSideContext: context
-                )
-            )
-        ) : .off,
-        preloadDictionary: true,
+        textReplacer: cachedTextReplacer ?? .empty,
+        specialCandidateProviders: nil,
+        zenzaiMode: zenzaiMode,
         metadata: .init(versionString: "Azookey for Windows")
     )
+    cachedOptions = options
+    cachedOptionsConfiguration = configuration
+    return options
 }
 
-class SimpleComposingText {
-    init(text: String, cursor: Int) {
-        self.text = UnsafeMutablePointer<CChar>(mutating: text.utf8String)!
-        self.cursor = cursor
+@MainActor
+private func reloadConfiguration() {
+    var updated = ServerConfiguration()
+    updated.context = configuration.context
+
+    if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
+        let settingsPath = URL(filePath: appDataPath)
+            .appendingPathComponent("Azookey/settings.json")
+        do {
+            let data = try Data(contentsOf: settingsPath)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let zenzai = json["zenzai"] as? [String: Any] {
+                updated.enableZenzai = zenzai["enable"] as? Bool ?? false
+                updated.profile = zenzai["profile"] as? String ?? ""
+            }
+        } catch {
+            // Missing settings are equivalent to the defaults. Log malformed/unreadable files
+            // once per explicit reload rather than once per key event.
+            print("Failed to read settings: \(error)")
+        }
     }
 
-    var text: UnsafeMutablePointer<CChar>
-    var cursor: Int
+    let modelConfigurationChanged =
+        updated.enableZenzai != configuration.enableZenzai ||
+        updated.profile != configuration.profile
+    configuration = updated
+    cachedOptions = nil
+    cachedOptionsConfiguration = nil
+    if modelConfigurationChanged {
+        converter?.stopComposition()
+    }
 }
 
-struct SComposingText {
-    var text: UnsafeMutablePointer<CChar>
-    var cursor: Int
+private func duplicateCString(_ string: String) -> UnsafeMutablePointer<CChar>? {
+    string.withCString { pointer in
+#if os(Windows)
+        _strdup(pointer)
+#else
+        strdup(pointer)
+#endif
+    }
 }
 
-func constructCandidateString(candidate: Candidate, hiragana: String) -> String {
+private func releaseCString(_ pointer: UnsafeMutablePointer<CChar>?) {
+    guard let pointer else {
+        return
+    }
+    free(UnsafeMutableRawPointer(pointer))
+}
+
+private func constructCandidateString(candidate: Candidate, hiragana: String) -> String {
     var remainingHiragana = hiragana
     var result = ""
-    
+
     for data in candidate.data {
         if remainingHiragana.count < data.ruby.count {
             result += remainingHiragana
@@ -68,140 +132,325 @@ func constructCandidateString(candidate: Candidate, hiragana: String) -> String 
         remainingHiragana.removeFirst(data.ruby.count)
         result += data.word
     }
-    
+
     return result
 }
 
-@_silgen_name("LoadConfig")
-@MainActor public func load_config() {
-    if let appDataPath = ProcessInfo.processInfo.environment["APPDATA"] {
-        let settingsPath = URL(filePath: appDataPath).appendingPathComponent("Azookey/settings.json")
-        
-        do {
-            let data = try Data(contentsOf: settingsPath)
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let zenzaiDict = json["zenzai"] as? [String: Any] {
-                
-                if let enableValue = zenzaiDict["enable"] as? Bool {
-                    config["enable"] = enableValue
-                }
-                
-                if let profileValue = zenzaiDict["profile"] as? String {
-                    config["profile"] = profileValue
-                }
+func rawInputString(from pieces: [InputPiece]) -> String {
+    String(
+        pieces.compactMap { piece -> Character? in
+            switch piece {
+            case .character(let character):
+                return character
+            case .key(intention: let character, modifiers: _):
+                return character
+            case .compositionSeparator:
+                return nil
             }
-        } catch {
-            print("Failed to read settings: \(error)")
         }
+    )
+}
+
+@MainActor
+private func candidatePayloads() -> [CandidatePayload]? {
+    guard let converter, let options = requestOptions() else {
+        return nil
     }
-}
 
-@_silgen_name("Initialize")
-@MainActor public func initialize(
-    path: UnsafePointer<CChar>,
-    use_zenzai: Bool
-) {
-    let path = String(cString: path)
-    execURL = URL(filePath: path)
-
-    load_config()
-
-    composingText.insertAtCursorPosition("a", inputStyle: .roman2kana)
-    converter.requestCandidates(composingText, options: getOptions())
-    composingText = ComposingText()
-}
-
-@_silgen_name("AppendText")
-@MainActor public func append_text(
-    input: UnsafePointer<CChar>,
-    cursorPtr: UnsafeMutablePointer<Int>
-) -> UnsafeMutablePointer<CChar> {
-    let inputString = String(cString: input)
-    composingText.insertAtCursorPosition(inputString, inputStyle: .roman2kana)
-
-    cursorPtr.pointee = composingText.convertTargetCursorPosition    
-    return _strdup(composingText.convertTarget)!
-}
-
-@_silgen_name("RemoveText")
-@MainActor public func remove_text(
-    cursorPtr: UnsafeMutablePointer<Int>
-) -> UnsafeMutablePointer<CChar> {
-    composingText.deleteBackwardFromCursorPosition(count: 1)
-
-    cursorPtr.pointee = composingText.convertTargetCursorPosition
-    return _strdup(composingText.convertTarget)!
-}
-
-@_silgen_name("MoveCursor")
-@MainActor public func move_cursor(
-    offset: Int32,
-    cursorPtr: UnsafeMutablePointer<Int>
-) -> UnsafeMutablePointer<CChar> {
-    let previousCursor = composingText.convertTargetCursorPosition
-    let cursor = composingText.moveCursorFromCursorPosition(count: Int(offset))
-    print("offset: \(offset), cursor: \(cursor)")
-
-    cursorPtr.pointee = cursor
-    return _strdup(composingText.convertTarget)!
-}
-
-@_silgen_name("ClearText")
-@MainActor public func clear_text() {
-    composingText = ComposingText()
-}
-
-func to_list_pointer(_ list: [FFICandidate]) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
-    let pointer = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>.allocate(capacity: list.count)
-    for (i, item) in list.enumerated() {
-        pointer[i] = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
-        pointer[i]?.pointee = item
-    }
-    return pointer
-}
-
-@_silgen_name("GetComposedText")
-@MainActor public func get_composed_text(lengthPtr: UnsafeMutablePointer<Int>) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?> {
     let hiragana = composingText.convertTarget
-    let contextString = (config["context"] as? String) ?? ""
-    let options = getOptions(context: contextString)
     let converted = converter.requestCandidates(composingText, options: options)
-    var result: [FFICandidate] = []
+    var seenTexts = Set<String>()
+    var result: [CandidatePayload] = []
+    result.reserveCapacity(converted.mainResults.count)
 
-    for i in 0..<converted.mainResults.count {
-        let candidate = converted.mainResults[i]
-
-        let text = strdup(constructCandidateString(candidate: candidate, hiragana: hiragana))
-        let hiragana = strdup(hiragana)
-        let correspondingCount = candidate.correspondingCount
+    for candidate in converted.mainResults {
+        let text = constructCandidateString(candidate: candidate, hiragana: hiragana)
+        guard seenTexts.insert(text).inserted else {
+            continue
+        }
 
         var afterComposingText = composingText
-        afterComposingText.prefixComplete(correspondingCount: correspondingCount)
-        let subtext = strdup(afterComposingText.convertTarget)
+        afterComposingText.prefixComplete(composingCount: candidate.composingCount)
+        let completedSurfaceCount = hiragana.count - afterComposingText.convertTarget.count
+        guard completedSurfaceCount >= 0,
+              completedSurfaceCount <= hiragana.count,
+              let correspondingCount = Int32(exactly: completedSurfaceCount) else {
+            return nil
+        }
 
-        result.append(FFICandidate(text: text, subtext: subtext, hiragana: hiragana, correspondingCount: Int32(correspondingCount)))        
+        result.append(
+            CandidatePayload(
+                text: text,
+                subtext: afterComposingText.convertTarget,
+                correspondingCount: correspondingCount
+            )
+        )
     }
 
-    lengthPtr.pointee = result.count
-
-    return to_list_pointer(result)
+    return result
 }
 
-@_silgen_name("ShrinkText")
-@MainActor public func shrink_text(
-    offset: Int32
-) -> UnsafeMutablePointer<CChar>  {
-    var afterComposingText = composingText
-    afterComposingText.prefixComplete(correspondingCount: Int(offset))
-    composingText = afterComposingText
-
-    return _strdup(composingText.convertTarget)!
-}
-
-@_silgen_name("SetContext")
-@MainActor public func set_context(
-    context: UnsafePointer<CChar>
+private func releaseCandidateList(
+    _ list: UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>,
+    initializedCount: Int
 ) {
+    for index in 0..<initializedCount {
+        guard let candidate = list[index] else {
+            continue
+        }
+        releaseCString(candidate.pointee.text)
+        releaseCString(candidate.pointee.subtext)
+        candidate.deinitialize(count: 1)
+        candidate.deallocate()
+    }
+    list.deinitialize(count: initializedCount)
+    list.deallocate()
+}
+
+private func allocateCandidateList(
+    _ payloads: [CandidatePayload]
+) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>? {
+    guard !payloads.isEmpty else {
+        return nil
+    }
+
+    let list = UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>
+        .allocate(capacity: payloads.count)
+    var initializedCount = 0
+
+    for payload in payloads {
+        guard let text = duplicateCString(payload.text) else {
+            releaseCandidateList(list, initializedCount: initializedCount)
+            return nil
+        }
+        guard let subtext = duplicateCString(payload.subtext) else {
+            releaseCString(text)
+            releaseCandidateList(list, initializedCount: initializedCount)
+            return nil
+        }
+
+        let candidate = UnsafeMutablePointer<FFICandidate>.allocate(capacity: 1)
+        candidate.initialize(
+            to: FFICandidate(
+                text: text,
+                subtext: subtext,
+                correspondingCount: payload.correspondingCount
+            )
+        )
+        list.advanced(by: initializedCount).initialize(to: candidate)
+        initializedCount += 1
+    }
+
+    return list
+}
+
+@MainActor
+private func copyCurrentComposingText(
+    cursorPointer: UnsafeMutablePointer<Int32>
+) -> UnsafeMutablePointer<CChar>? {
+    guard let cursor = Int32(exactly: composingText.convertTargetCursorPosition) else {
+        return nil
+    }
+    cursorPointer.pointee = cursor
+    return duplicateCString(composingText.convertTarget)
+}
+
+@_cdecl("LoadConfig")
+@MainActor
+public func loadConfig() -> Int32 {
+    reloadConfiguration()
+    return ffiSuccess
+}
+
+@_cdecl("Initialize")
+@MainActor
+public func initialize(
+    path: UnsafePointer<CChar>?,
+    useZenzai: Int32
+) -> Int32 {
+    guard let path else {
+        return ffiInvalidArgument
+    }
+    let pathString = String(cString: path)
+    guard !pathString.isEmpty else {
+        return ffiInvalidArgument
+    }
+
+    converter?.stopComposition()
+    composingText.stopComposition()
+
+    let newExecutableURL = URL(filePath: pathString)
+    executableURL = newExecutableURL
+    zenzaiAllowed = useZenzai != 0
+    cachedOptions = nil
+    cachedOptionsConfiguration = nil
+
+    let emojiURL = newExecutableURL
+        .appendingPathComponent("EmojiDictionary")
+        .appendingPathComponent("emoji_all_E15.1.txt")
+    cachedTextReplacer = TextReplacer { emojiURL }
+    converter = KanaKanjiConverter(
+        dictionaryURL: newExecutableURL.appendingPathComponent("Dictionary"),
+        preloadDictionary: true
+    )
+    reloadConfiguration()
+
+    // Warm dictionary/model initialization without leaking the warm-up composition into the
+    // first real conversion session.
+    if let converter, let options = requestOptions() {
+        composingText.insertAtCursorPosition("a", inputStyle: .roman2kana)
+        _ = converter.requestCandidates(composingText, options: options)
+        composingText.stopComposition()
+        converter.stopComposition()
+    }
+
+    return ffiSuccess
+}
+
+@_cdecl("AppendText")
+@MainActor
+public func appendText(
+    input: UnsafePointer<CChar>?,
+    cursorPointer: UnsafeMutablePointer<Int32>?
+) -> UnsafeMutablePointer<CChar>? {
+    guard converter != nil, let input, let cursorPointer else {
+        return nil
+    }
+    composingText.insertAtCursorPosition(String(cString: input), inputStyle: .roman2kana)
+    return copyCurrentComposingText(cursorPointer: cursorPointer)
+}
+
+@_cdecl("RemoveText")
+@MainActor
+public func removeText(
+    cursorPointer: UnsafeMutablePointer<Int32>?
+) -> UnsafeMutablePointer<CChar>? {
+    guard converter != nil, let cursorPointer else {
+        return nil
+    }
+    composingText.deleteBackwardFromCursorPosition(count: 1)
+    return copyCurrentComposingText(cursorPointer: cursorPointer)
+}
+
+@_cdecl("MoveCursor")
+@MainActor
+public func moveCursor(
+    offset: Int32,
+    cursorPointer: UnsafeMutablePointer<Int32>?
+) -> UnsafeMutablePointer<CChar>? {
+    guard converter != nil, let cursorPointer else {
+        return nil
+    }
+    _ = composingText.moveCursorFromCursorPosition(count: Int(offset))
+    return copyCurrentComposingText(cursorPointer: cursorPointer)
+}
+
+@_cdecl("ShrinkText")
+@MainActor
+public func shrinkText(offset: Int32) -> UnsafeMutablePointer<CChar>? {
+    guard converter != nil,
+          offset >= 0,
+          Int(offset) <= composingText.convertTarget.count else {
+        return nil
+    }
+    composingText.prefixComplete(composingCount: .surfaceCount(Int(offset)))
+    return duplicateCString(composingText.convertTarget)
+}
+
+@_cdecl("CommitPrefixAndAppend")
+@MainActor
+public func commitPrefixAndAppend(
+    offset: Int32,
+    input: UnsafePointer<CChar>?,
+    cursorPointer: UnsafeMutablePointer<Int32>?
+) -> UnsafeMutablePointer<CChar>? {
+    guard converter != nil,
+          offset >= 0,
+          Int(offset) <= composingText.convertTarget.count,
+          let input,
+          let cursorPointer else {
+        return nil
+    }
+
+    composingText.prefixComplete(composingCount: .surfaceCount(Int(offset)))
+    composingText.insertAtCursorPosition(String(cString: input), inputStyle: .roman2kana)
+    return copyCurrentComposingText(cursorPointer: cursorPointer)
+}
+
+@_cdecl("ClearText")
+@MainActor
+public func clearText() {
+    composingText.stopComposition()
+    converter?.stopComposition()
+    if !configuration.context.isEmpty {
+        configuration.context = ""
+        cachedOptions = nil
+        cachedOptionsConfiguration = nil
+    }
+}
+
+@_cdecl("GetComposedText")
+@MainActor
+public func getComposedText(
+    lengthPointer: UnsafeMutablePointer<Int32>?
+) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>? {
+    guard let lengthPointer else {
+        return nil
+    }
+    lengthPointer.pointee = -1
+
+    guard let payloads = candidatePayloads(),
+          let length = Int32(exactly: payloads.count) else {
+        return nil
+    }
+    guard !payloads.isEmpty else {
+        lengthPointer.pointee = 0
+        return nil
+    }
+    guard let list = allocateCandidateList(payloads) else {
+        return nil
+    }
+
+    lengthPointer.pointee = length
+    return list
+}
+
+@_cdecl("GetRawInput")
+@MainActor
+public func getRawInput() -> UnsafeMutablePointer<CChar>? {
+    guard converter != nil else {
+        return nil
+    }
+    return duplicateCString(rawInputString(from: composingText.input.map(\.piece)))
+}
+
+@_cdecl("FreeCString")
+public func freeCString(pointer: UnsafeMutablePointer<CChar>?) {
+    releaseCString(pointer)
+}
+
+@_cdecl("FreeCandidateList")
+public func freeCandidateList(
+    candidates: UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>?,
+    length: Int32
+) {
+    guard let candidates, length >= 0 else {
+        return
+    }
+    releaseCandidateList(candidates, initializedCount: Int(length))
+}
+
+@_cdecl("SetContext")
+@MainActor
+public func setContext(context: UnsafePointer<CChar>?) -> Int32 {
+    guard let context else {
+        return ffiInvalidArgument
+    }
     let contextString = String(cString: context)
-    config["context"] = contextString
+    if configuration.context != contextString {
+        configuration.context = contextString
+        cachedOptions = nil
+        cachedOptionsConfiguration = nil
+    }
+    return ffiSuccess
 }
