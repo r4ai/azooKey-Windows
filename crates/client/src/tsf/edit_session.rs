@@ -7,14 +7,14 @@ use windows::{
             ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
             ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, GUID_PROP_ATTRIBUTE, TF_AE_NONE,
             TF_ANCHOR_END, TF_ANCHOR_START, TF_ES_READWRITE, TF_IAS_QUERYONLY, TF_SELECTION,
-            TF_SELECTIONSTYLE, TF_ST_CORRECTION, TF_TF_MOVESTART,
+            TF_SELECTIONSTYLE, TF_ST_CORRECTION,
         },
     },
 };
 
 use std::{cell::Cell, mem::ManuallyDrop, rc::Rc, time::Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::{engine::state::IMEState, extension::StringExt as _, globals::GUID_DISPLAY_ATTRIBUTE};
 
@@ -106,7 +106,8 @@ impl TextServiceFactory {
         tracing::debug!("end_composition");
         let text_service = self.borrow()?;
 
-        if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
+        let tip_composition = { text_service.borrow_composition()?.tip_composition.clone() };
+        if let Some(composition) = tip_composition {
             edit_session(
                 text_service.tid,
                 text_service.context()?,
@@ -116,16 +117,6 @@ impl TextServiceFactory {
                     move |cookie| unsafe {
                         // clear display attribute first
                         let range: ITfRange = composition.GetRange()?;
-
-                        // set existing text to the composition
-                        let mut text = vec![0; 1024];
-                        let mut text_len = 1024;
-
-                        let range_new = range.Clone()?;
-                        range_new.GetText(cookie, TF_TF_MOVESTART, &mut text, &mut text_len)?;
-
-                        text = text[..text_len as usize].to_vec();
-                        range.SetText(cookie, TF_ST_CORRECTION, &text)?;
 
                         let prop = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
                         prop.Clear(cookie, &range)?;
@@ -160,12 +151,13 @@ impl TextServiceFactory {
     pub fn set_text(&self, text: &str, subtext: &str) -> Result<()> {
         let text_service = self.borrow()?;
 
-        if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
+        let tip_composition = { text_service.borrow_composition()?.tip_composition.clone() };
+        if let Some(composition) = tip_composition {
             edit_session(
                 text_service.tid,
                 text_service.context()?,
                 Rc::new({
-                    let text_len = text.chars().count() as i32;
+                    let text_len = i32::try_from(text.encode_utf16().count()).unwrap_or(i32::MAX);
 
                     // unpadded is all you need!
                     let text = format!("{text}{subtext}").as_str().to_wide_16_unpadded();
@@ -214,12 +206,13 @@ impl TextServiceFactory {
     pub fn shift_start(&self, text: &str, subtext: &str) -> Result<()> {
         let text_service = self.borrow()?;
 
-        if let Some(composition) = text_service.borrow_composition()?.tip_composition.clone() {
+        let tip_composition = { text_service.borrow_composition()?.tip_composition.clone() };
+        if let Some(composition) = tip_composition {
             edit_session(
                 text_service.tid,
                 text_service.context()?,
                 Rc::new({
-                    let text_len = text.chars().count() as i32;
+                    let text_len = i32::try_from(text.encode_utf16().count()).unwrap_or(i32::MAX);
                     let subtext = subtext.to_wide_16_unpadded();
                     let context = text_service.context::<ITfContext>()?;
                     let display_attribute_atom = text_service.display_attribute_atom.clone();

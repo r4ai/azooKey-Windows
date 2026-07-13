@@ -1,6 +1,6 @@
 use shared::proto::{
     window_service_server::WindowService as WindowServiceProto, EmptyResponse, SetCandidateRequest,
-    SetInputModeRequest, SetPositionRequest, SetSelectionRequest,
+    SetCandidateStateRequest, SetInputModeRequest, SetPositionRequest, SetSelectionRequest,
 };
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
@@ -32,6 +32,10 @@ pub enum WindowAction {
     },
     SetCandidate {
         candidates: Vec<String>,
+    },
+    SetCandidateState {
+        candidates: Vec<String>,
+        selection: i32,
     },
     SetInputMode(String),
 }
@@ -102,6 +106,24 @@ impl WindowServiceProto for WindowService {
             })
             .await
             .unwrap();
+
+        Ok(Response::new(EmptyResponse {}))
+    }
+
+    async fn set_candidate_state(
+        &self,
+        request: Request<SetCandidateStateRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let request = request.into_inner();
+
+        self.controller
+            .sender
+            .send(WindowAction::SetCandidateState {
+                candidates: request.candidates,
+                selection: request.selection,
+            })
+            .await
+            .map_err(|_| Status::unavailable("candidate window event loop stopped"))?;
 
         Ok(Response::new(EmptyResponse {}))
     }

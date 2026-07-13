@@ -1,4 +1,3 @@
-use std::cmp::max;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -33,10 +32,30 @@ pub mod utils;
 #[derive(Debug)]
 pub enum UserEvent {
     UpdateHeight(i32),
-    UpdateCandidates(String),
-    UpdateSelection(i32),
-    UpdateInputMethod(String),
     WindowAction(WindowAction),
+}
+
+const CANDIDATE_WINDOW_MIN_WIDTH: u32 = 225;
+const CANDIDATE_WINDOW_MAX_WIDTH: u32 = 720;
+const CANDIDATE_WINDOW_BASE_WIDTH: u32 = 120;
+const CANDIDATE_CHARACTER_WIDTH: u32 = 18;
+
+fn candidate_window_width(candidates: &[String]) -> u32 {
+    let measured_character_limit = ((CANDIDATE_WINDOW_MAX_WIDTH - CANDIDATE_WINDOW_BASE_WIDTH)
+        / CANDIDATE_CHARACTER_WIDTH
+        + 1) as usize;
+    let max_len = candidates
+        .iter()
+        .map(|candidate| candidate.chars().take(measured_character_limit).count())
+        .max()
+        .unwrap_or(0);
+    let estimated = CANDIDATE_WINDOW_BASE_WIDTH.saturating_add(
+        u32::try_from(max_len)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(CANDIDATE_CHARACTER_WIDTH),
+    );
+
+    estimated.clamp(CANDIDATE_WINDOW_MIN_WIDTH, CANDIDATE_WINDOW_MAX_WIDTH)
 }
 
 #[tokio::main]
@@ -96,61 +115,65 @@ async fn main() -> anyhow::Result<()> {
     let proxy_clone = event_loop_proxy.clone();
     tokio::spawn(async move {
         while let Some(action) = rx.recv().await {
-            match action {
-                WindowAction::Show => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::Show))
-                        .unwrap();
-                }
-                WindowAction::Hide => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::Hide))
-                        .unwrap();
-                }
-                WindowAction::SetPosition {
-                    top,
-                    left,
-                    bottom,
-                    right,
-                } => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetPosition {
-                            top,
-                            left,
-                            bottom,
-                            right,
-                        }))
-                        .unwrap();
-                }
-                WindowAction::SetCandidate { candidates } => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetCandidate {
-                            candidates,
-                        }))
-                        .unwrap();
-                }
-                WindowAction::SetSelection { index } => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetSelection {
-                            index,
-                        }))
-                        .unwrap();
-                }
-                WindowAction::SetInputMode(input_method) => {
-                    proxy_clone
-                        .send_event(UserEvent::WindowAction(WindowAction::SetInputMode(
-                            input_method,
-                        )))
-                        .unwrap();
-                }
+            if proxy_clone
+                .send_event(UserEvent::WindowAction(action))
+                .is_err()
+            {
+                break;
             }
         }
     });
 
+    let mut candidate_anchor = None;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         let indicator_hwnd = indicator_window.hwnd();
+        let show_candidate_window = || {
+            if let Ok(mut task_guard) = task_guard.try_lock() {
+                if let Some(task) = task_guard.take() {
+                    task.abort();
+                    let _ = unsafe {
+                        ShowWindow(HWND(indicator_hwnd as *mut std::ffi::c_void), SW_HIDE)
+                    };
+                }
+            }
+
+            let _ = unsafe {
+                ShowWindow(
+                    HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
+                    SW_SHOWNOACTIVATE,
+                )
+            };
+        };
+        let position_windows = |top, left, bottom, right| {
+            let (x, y) = get_candidate_window_position(top, left, bottom, right, &candidate_window);
+
+            unsafe {
+                let _ = SetWindowPos(
+                    HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+
+                let _ = SetWindowPos(
+                    HWND(indicator_hwnd as *mut std::ffi::c_void),
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            candidate_window.set_outer_position(PhysicalPosition::new(x, y));
+            indicator_window
+                .set_outer_position(PhysicalPosition::new((left - 45) as f64, bottom as f64));
+        };
 
         match event {
             Event::NewEvents(StartCause::Init) => {}
@@ -159,164 +182,132 @@ async fn main() -> anyhow::Result<()> {
                 ..
             } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(script) => match script {
-                UserEvent::UpdateCandidates(candidates) => {
-                    candidate_webview
-                        .evaluate_script(&format!("updateCandidates({})", candidates))
-                        .unwrap();
-                }
-                UserEvent::UpdateSelection(index) => {
-                    candidate_webview
-                        .evaluate_script(&format!("updateSelection({})", index))
-                        .unwrap();
-                }
-                UserEvent::UpdateInputMethod(input_method) => {
-                    indicator_webview
-                        .evaluate_script(&format!("updateInputMethod(\"{}\")", input_method))
-                        .unwrap();
-                }
                 UserEvent::UpdateHeight(height) => {
                     let width = candidate_window.inner_size().width as i32;
                     candidate_window.set_inner_size(LogicalSize::new(width, height));
                 }
-                UserEvent::WindowAction(action) => {
-                    match action {
-                        WindowAction::Show => {
-                            // if mode indicator is already shown, hide it
-                            let mut task_guard = match task_guard.try_lock() {
-                                Ok(guard) => guard,
-                                Err(_) => {
-                                    eprintln!(
-                                        "Warning: Failed to lock task_guard, skipping cleanup"
-                                    );
-                                    return;
-                                }
-                            };
+                UserEvent::WindowAction(action) => match action {
+                    WindowAction::Show => {
+                        show_candidate_window();
+                    }
+                    WindowAction::Hide => {
+                        let _ = unsafe {
+                            ShowWindow(
+                                HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
+                                SW_HIDE,
+                            )
+                        };
+                    }
+                    WindowAction::SetPosition {
+                        top,
+                        left,
+                        bottom,
+                        right,
+                    } => {
+                        candidate_anchor = Some((top, left, bottom, right));
+                        position_windows(top, left, bottom, right);
+                    }
+                    WindowAction::SetCandidate { candidates } => {
+                        let height = candidate_window.inner_size().height as i32;
+                        candidate_window.set_inner_size(PhysicalSize::new(
+                            candidate_window_width(&candidates),
+                            height as u32,
+                        ));
+                        if let Some((top, left, bottom, right)) = candidate_anchor {
+                            position_windows(top, left, bottom, right);
+                        }
+
+                        let candidates = serde_json::to_string(&candidates)
+                            .context("Failed to serialize candidates")
+                            .unwrap();
+                        candidate_webview
+                            .evaluate_script(&format!("updateCandidates({candidates})"))
+                            .unwrap();
+                    }
+                    WindowAction::SetCandidateState {
+                        candidates,
+                        selection,
+                    } => {
+                        show_candidate_window();
+                        let height = candidate_window.inner_size().height as i32;
+                        candidate_window.set_inner_size(PhysicalSize::new(
+                            candidate_window_width(&candidates),
+                            height as u32,
+                        ));
+                        if let Some((top, left, bottom, right)) = candidate_anchor {
+                            position_windows(top, left, bottom, right);
+                        }
+
+                        let candidates = serde_json::to_string(&candidates)
+                            .context("Failed to serialize candidates")
+                            .unwrap();
+                        candidate_webview
+                            .evaluate_script(&format!(
+                                "updateCandidateState({candidates}, {selection})"
+                            ))
+                            .unwrap();
+                    }
+                    WindowAction::SetSelection { index } => {
+                        candidate_webview
+                            .evaluate_script(&format!("updateSelection({index})"))
+                            .unwrap();
+                    }
+                    WindowAction::SetInputMode(input_method) => {
+                        let input_method = serde_json::to_string(&input_method)
+                            .context("Failed to serialize input method")
+                            .unwrap();
+                        indicator_webview
+                            .evaluate_script(&format!("updateInputMethod({input_method})"))
+                            .unwrap();
+
+                        let task_guard = task_guard.try_lock();
+
+                        if let Ok(mut task_guard) = task_guard {
                             if let Some(task) = task_guard.take() {
                                 task.abort();
+                            }
+
+                            *task_guard = Some(tokio::spawn(async move {
+                                let _ = unsafe {
+                                    ShowWindow(
+                                        HWND(indicator_hwnd as *mut std::ffi::c_void),
+                                        SW_SHOWNOACTIVATE,
+                                    )
+                                };
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 let _ = unsafe {
                                     ShowWindow(
                                         HWND(indicator_hwnd as *mut std::ffi::c_void),
                                         SW_HIDE,
                                     )
                                 };
-                            }
-
-                            let _ = unsafe {
-                                ShowWindow(
-                                    HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
-                                    SW_SHOWNOACTIVATE,
-                                )
-                            };
-                        }
-                        WindowAction::Hide => {
-                            let _ = unsafe {
-                                ShowWindow(
-                                    HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
-                                    SW_HIDE,
-                                )
-                            };
-                        }
-                        WindowAction::SetPosition {
-                            top,
-                            left,
-                            bottom,
-                            right,
-                        } => {
-                            let (x, y) = get_candidate_window_position(
-                                top,
-                                left,
-                                bottom,
-                                right,
-                                &candidate_window,
-                            );
-
-                            unsafe {
-                                let _ = SetWindowPos(
-                                    HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
-                                    HWND_TOPMOST,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                                );
-
-                                let _ = SetWindowPos(
-                                    HWND(indicator_hwnd as *mut std::ffi::c_void),
-                                    HWND_TOPMOST,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                                );
-                            }
-                            candidate_window
-                                .set_outer_position(PhysicalPosition::new(x as f64, y as f64));
-                            indicator_window.set_outer_position(PhysicalPosition::new(
-                                (left - 45) as f64,
-                                bottom as f64,
-                            ));
-                        }
-                        WindowAction::SetCandidate { candidates } => {
-                            let max_len = candidates
-                                .iter()
-                                .map(|s| s.chars().count())
-                                .max()
-                                .unwrap_or(0) as u32;
-
-                            let height = candidate_window.inner_size().height as i32;
-                            candidate_window.set_inner_size(PhysicalSize::new(
-                                max(225, 120 + max_len * 18),
-                                height as u32,
-                            ));
-
-                            let candidates = serde_json::to_string(&candidates)
-                                .context("Failed to serialize candidates")
-                                .unwrap();
-
-                            event_loop_proxy
-                                .send_event(UserEvent::UpdateCandidates(candidates))
-                                .unwrap();
-                        }
-                        WindowAction::SetSelection { index } => {
-                            event_loop_proxy
-                                .send_event(UserEvent::UpdateSelection(index))
-                                .unwrap();
-                        }
-                        WindowAction::SetInputMode(input_method) => {
-                            event_loop_proxy
-                                .send_event(UserEvent::UpdateInputMethod(input_method))
-                                .unwrap();
-
-                            let task_guard = task_guard.try_lock();
-
-                            if let Ok(mut task_guard) = task_guard {
-                                if let Some(task) = task_guard.take() {
-                                    task.abort();
-                                }
-
-                                *task_guard = Some(tokio::spawn(async move {
-                                    let _ = unsafe {
-                                        ShowWindow(
-                                            HWND(indicator_hwnd as *mut std::ffi::c_void),
-                                            SW_SHOWNOACTIVATE,
-                                        )
-                                    };
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                    let _ = unsafe {
-                                        ShowWindow(
-                                            HWND(indicator_hwnd as *mut std::ffi::c_void),
-                                            SW_HIDE,
-                                        )
-                                    };
-                                }));
-                            }
+                            }));
                         }
                     }
-                }
+                },
             },
             _ => (),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_width_is_bounded() {
+        assert_eq!(candidate_window_width(&[]), CANDIDATE_WINDOW_MIN_WIDTH);
+        assert_eq!(
+            candidate_window_width(&["あ".repeat(10_000)]),
+            CANDIDATE_WINDOW_MAX_WIDTH
+        );
+    }
+
+    #[test]
+    fn candidate_width_counts_characters_not_utf8_bytes() {
+        let expected = (CANDIDATE_WINDOW_BASE_WIDTH + 10 * CANDIDATE_CHARACTER_WIDTH)
+            .clamp(CANDIDATE_WINDOW_MIN_WIDTH, CANDIDATE_WINDOW_MAX_WIDTH);
+        assert_eq!(candidate_window_width(&["あ".repeat(10)]), expected);
+    }
 }

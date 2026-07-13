@@ -20,6 +20,12 @@ message SetCandidateRequest {
   repeated string candidates = 1;
 }
 
+// 候補一覧と選択位置を一度に更新するメッセージ
+message SetCandidateStateRequest {
+  repeated string candidates = 1;
+  int32 selection = 2;
+}
+
 // 変換候補を選択するメッセージ
 message SetSelectionRequest {
   int32 index = 1;
@@ -37,6 +43,7 @@ service WindowService {
   rpc ShowWindow (EmptyResponse) returns (EmptyResponse); // ウィンドウを表示
   rpc HideWindow (EmptyResponse) returns (EmptyResponse); // ウィンドウを非表示
   rpc SetCandidate (SetCandidateRequest) returns (EmptyResponse); // 候補の設定
+  rpc SetCandidateState (SetCandidateStateRequest) returns (EmptyResponse); // 候補と選択位置の設定
   rpc SetSelection (SetSelectionRequest) returns (EmptyResponse); // 変換候補を選択
   rpc SetWindowPosition (SetPositionRequest) returns (EmptyResponse); // ウィンドウの位置を設定
   rpc SetInputMode (SetInputModeRequest) returns (EmptyResponse); // 変換モードの設定

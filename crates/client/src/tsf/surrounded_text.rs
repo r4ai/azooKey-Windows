@@ -105,7 +105,17 @@ impl TextServiceFactory {
         }
     }
 
-    pub fn update_context(&self, preview: &str) -> Result<()> {
+    /// Updates the conversion context from text preceding the active composition.
+    ///
+    /// `composition_utf16_count` excludes the entire displayed composition from the
+    /// surrounding-text range. `committed_text` is appended when a selected prefix is about
+    /// to leave the composition, so the next prediction sees that prefix without another TSF
+    /// query after the edit.
+    pub fn update_context(
+        &self,
+        composition_utf16_count: usize,
+        committed_text: &str,
+    ) -> Result<()> {
         let result: Result<()> = (|| unsafe {
             let text_service = self.borrow()?;
 
@@ -116,7 +126,8 @@ impl TextServiceFactory {
                 text_service.tid,
                 parent_context.clone(),
                 Rc::new({
-                    let preview_count = preview.chars().count() as i32;
+                    let composition_utf16_count =
+                        i32::try_from(composition_utf16_count).unwrap_or(i32::MAX);
 
                     move |cookie| {
                         // 2. Get the selection from the parent context.
@@ -157,7 +168,7 @@ impl TextServiceFactory {
 
                         preceding_range.ShiftEnd(
                             cookie,
-                            -preview_count,
+                            -composition_utf16_count,
                             &mut preceding_range_shifted,
                             &halt_cond,
                         )?;
@@ -176,9 +187,11 @@ impl TextServiceFactory {
                 }),
             )?;
 
-            let Some(preceding_text) = preceding_text else {
+            let Some(mut preceding_text) = preceding_text else {
                 return Ok(());
             };
+
+            preceding_text.push_str(committed_text);
 
             let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
                 return Ok(());

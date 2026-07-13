@@ -4,10 +4,11 @@ use super::input_mode::InputMode;
 pub enum ClientAction {
     StartComposition,
     EndComposition,
+    DiscardComposition,
 
     AppendText(String),
     RemoveText,
-    ShrinkText(String),
+    CommitPrefixAndAppend(String),
 
     SetTextWithType(SetTextType),
 

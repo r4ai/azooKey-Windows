@@ -1,4 +1,7 @@
-use std::cmp::{max, min};
+use std::{
+    cmp::{max, min},
+    sync::Arc,
+};
 
 use crate::{
     engine::user_action::UserAction,
@@ -25,7 +28,7 @@ use windows::Win32::{
 
 use anyhow::{Context, Result};
 
-#[derive(Default, Clone, PartialEq, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CompositionState {
     #[default]
     None,
@@ -34,20 +37,49 @@ pub enum CompositionState {
     Selecting,
 }
 
-#[derive(Default, Clone, Debug)]
+fn is_last_composing_character(text: &str) -> bool {
+    text.chars().nth(1).is_none()
+}
+
+fn text_with_type(set_type: &SetTextType, raw_input: &str, raw_hiragana: &str) -> String {
+    match set_type {
+        SetTextType::Hiragana => raw_hiragana.to_owned(),
+        SetTextType::Katakana => to_katakana(raw_hiragana),
+        SetTextType::HalfKatakana => to_half_katakana(raw_hiragana),
+        SetTextType::FullLatin => to_fullwidth(raw_input, true),
+        SetTextType::HalfLatin => to_halfwidth(raw_input),
+    }
+}
+
+fn candidate_display_text(text: &str, sub_text: &str) -> String {
+    let mut display = String::with_capacity(text.len() + sub_text.len());
+    display.push_str(text);
+    display.push_str(sub_text);
+    display
+}
+
+fn snapshot_is_current(snapshot_generation: u64, current_generation: u64) -> bool {
+    snapshot_generation == current_generation
+}
+
+#[derive(Default, Debug)]
 pub struct Composition {
-    pub preview: String, // text to be previewed
-    pub suffix: String,  // text to be appended after preview
-    pub raw_input: String,
-    pub raw_hiragana: String,
+    // These strings are snapshotted while synchronous RPC/TSF calls run. Arc keeps that
+    // snapshot cheap for long compositions while preserving a stable state for re-entrant TSF
+    // callbacks.
+    pub preview: Arc<String>, // text to be previewed
+    pub suffix: Arc<String>,  // text to be appended after preview
+    pub raw_input: Arc<String>,
+    pub raw_hiragana: Arc<String>,
 
     pub corresponding_count: i32, // corresponding count of the preview
 
     pub selection_index: i32,
-    pub candidates: Candidates,
+    pub candidates: Arc<Candidates>,
 
     pub state: CompositionState,
     pub tip_composition: Option<ITfComposition>,
+    pub generation: u64,
 }
 
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
@@ -60,14 +92,56 @@ impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
         // if user clicked outside the composition, the composition will be terminated
         tracing::debug!("OnCompositionTerminated");
 
-        let actions = vec![ClientAction::EndComposition];
-        self.handle_action(&actions, CompositionState::None)?;
+        self.handle_composition_terminated()?;
 
         Ok(())
     }
 }
 
 impl TextServiceFactory {
+    fn composition_generation(&self) -> Result<u64> {
+        let text_service = self.borrow()?;
+        let generation = text_service.borrow_composition()?.generation;
+        Ok(generation)
+    }
+
+    fn handle_composition_terminated(&self) -> Result<()> {
+        {
+            let text_service = self.borrow()?;
+            let mut composition = text_service.borrow_mut_composition()?;
+            composition.preview = Arc::default();
+            composition.suffix = Arc::default();
+            composition.raw_input = Arc::default();
+            composition.raw_hiragana = Arc::default();
+            composition.corresponding_count = 0;
+            composition.selection_index = 0;
+            composition.candidates = Arc::default();
+            composition.state = CompositionState::None;
+            composition.tip_composition = None;
+            composition.generation = composition.generation.wrapping_add(1);
+        }
+
+        let ipc_service = match IMEState::get() {
+            Ok(state) => state.ipc_service.clone(),
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to get IPC service after composition termination: {error:?}"
+                );
+                None
+            }
+        };
+        if let Some(mut ipc_service) = ipc_service {
+            if let Err(error) = ipc_service.hide_window() {
+                tracing::warn!("Failed to hide candidate window after termination: {error:?}");
+            }
+            if let Err(error) = ipc_service.clear_text() {
+                tracing::warn!("Failed to clear server composition after termination: {error:?}");
+            }
+        }
+
+        Ok(())
+    }
+
     #[tracing::instrument]
     pub fn process_key(
         &self,
@@ -83,17 +157,21 @@ impl TextServiceFactory {
             return Ok(None);
         }
 
-        #[allow(clippy::let_and_return)]
-        let (composition, mode) = {
+        let (composition_state, is_last_input, suffix_is_empty, mode) = {
             let text_service = self.borrow()?;
-            let composition = text_service.borrow_composition()?.clone();
+            let composition = text_service.borrow_composition()?;
             let mode = IMEState::get()?.input_mode.clone();
-            (composition, mode)
+            (
+                composition.state,
+                is_last_composing_character(&composition.raw_hiragana),
+                composition.suffix.is_empty(),
+                mode,
+            )
         };
 
         let action = UserAction::try_from(wparam.0)?;
 
-        let (transition, actions) = match composition.state {
+        let (transition, actions) = match composition_state {
             CompositionState::None => match action {
                 UserAction::Input(char) if mode == InputMode::Kana => (
                     CompositionState::Composing,
@@ -130,28 +208,28 @@ impl TextServiceFactory {
                     vec![ClientAction::AppendText(number.to_string())],
                 ),
                 UserAction::Backspace => {
-                    if composition.preview.chars().count() == 1 {
+                    if is_last_input {
                         (
                             CompositionState::None,
-                            vec![ClientAction::RemoveText, ClientAction::EndComposition],
+                            vec![ClientAction::DiscardComposition],
                         )
                     } else {
                         (CompositionState::Composing, vec![ClientAction::RemoveText])
                     }
                 }
                 UserAction::Enter => {
-                    if composition.suffix.is_empty() {
+                    if suffix_is_empty {
                         (CompositionState::None, vec![ClientAction::EndComposition])
                     } else {
                         (
                             CompositionState::Composing,
-                            vec![ClientAction::ShrinkText("".to_string())],
+                            vec![ClientAction::CommitPrefixAndAppend("".to_string())],
                         )
                     }
                 }
                 UserAction::Escape => (
                     CompositionState::None,
-                    vec![ClientAction::RemoveText, ClientAction::EndComposition],
+                    vec![ClientAction::DiscardComposition],
                 ),
                 UserAction::Navigation(direction) => match direction {
                     Navigation::Right => (
@@ -211,35 +289,35 @@ impl TextServiceFactory {
             CompositionState::Previewing => match action {
                 UserAction::Input(char) => (
                     CompositionState::Composing,
-                    vec![ClientAction::ShrinkText(char.to_string())],
+                    vec![ClientAction::CommitPrefixAndAppend(char.to_string())],
                 ),
                 UserAction::Number(number) => (
                     CompositionState::Composing,
-                    vec![ClientAction::ShrinkText(number.to_string())],
+                    vec![ClientAction::CommitPrefixAndAppend(number.to_string())],
                 ),
                 UserAction::Backspace => {
-                    if composition.preview.chars().count() == 1 {
+                    if is_last_input {
                         (
                             CompositionState::None,
-                            vec![ClientAction::RemoveText, ClientAction::EndComposition],
+                            vec![ClientAction::DiscardComposition],
                         )
                     } else {
                         (CompositionState::Composing, vec![ClientAction::RemoveText])
                     }
                 }
                 UserAction::Enter => {
-                    if composition.suffix.is_empty() {
+                    if suffix_is_empty {
                         (CompositionState::None, vec![ClientAction::EndComposition])
                     } else {
                         (
                             CompositionState::Composing,
-                            vec![ClientAction::ShrinkText("".to_string())],
+                            vec![ClientAction::CommitPrefixAndAppend("".to_string())],
                         )
                     }
                 }
                 UserAction::Escape => (
                     CompositionState::None,
-                    vec![ClientAction::RemoveText, ClientAction::EndComposition],
+                    vec![ClientAction::DiscardComposition],
                 ),
                 UserAction::Navigation(direction) => match direction {
                     Navigation::Right => (
@@ -327,111 +405,163 @@ impl TextServiceFactory {
         actions: &[ClientAction],
         transition: CompositionState,
     ) -> Result<()> {
-        #[allow(clippy::let_and_return)]
-        let (composition, mode) = {
+        let (
+            mut preview,
+            mut suffix,
+            mut raw_input,
+            mut raw_hiragana,
+            mut corresponding_count,
+            mut candidates,
+            mut selection_index,
+            mut generation,
+            mode,
+        ) = {
             let text_service = self.borrow()?;
-            let composition = text_service.borrow_composition()?.clone();
+            let composition = text_service.borrow_composition()?;
             let mode = IMEState::get()?.input_mode.clone();
-            (composition, mode)
+            (
+                Arc::clone(&composition.preview),
+                Arc::clone(&composition.suffix),
+                Arc::clone(&composition.raw_input),
+                Arc::clone(&composition.raw_hiragana),
+                composition.corresponding_count,
+                Arc::clone(&composition.candidates),
+                composition.selection_index,
+                composition.generation,
+                mode,
+            )
         };
-
-        let mut preview = composition.preview.clone();
-        let mut suffix = composition.suffix.clone();
-        let mut raw_input = composition.raw_input.clone();
-        let mut raw_hiragana = composition.raw_hiragana.clone();
-        let mut corresponding_count = composition.corresponding_count.clone();
-        let mut candidates = composition.candidates.clone();
-        let mut selection_index = composition.selection_index;
         let mut ipc_service = IMEState::get()?
             .ipc_service
             .clone()
             .context("ipc_service is None")?;
         let mut transition = transition;
-
-        self.update_context(&preview)?;
+        macro_rules! abort_if_reentered {
+            () => {
+                if !snapshot_is_current(generation, self.composition_generation()?) {
+                    tracing::warn!("Discard stale composition action after TSF re-entry");
+                    if let Err(error) = ipc_service.hide_window() {
+                        tracing::warn!("Failed to hide window after TSF re-entry: {error:?}");
+                    }
+                    if let Err(error) = ipc_service.clear_text() {
+                        tracing::warn!("Failed to clear server after TSF re-entry: {error:?}");
+                    }
+                    return Ok(());
+                }
+            };
+        }
 
         for action in actions {
             match action {
                 ClientAction::StartComposition => {
+                    // Surrounding text is stable for the lifetime of a composition. Fetch it
+                    // once here instead of issuing a TSF edit session and an RPC for every key.
+                    self.update_context(0, "")?;
+                    abort_if_reentered!();
                     self.start_composition()?;
+                    abort_if_reentered!();
                     self.update_pos()?;
-                    ipc_service.show_window()?;
+                    abort_if_reentered!();
                 }
                 ClientAction::EndComposition => {
                     self.end_composition()?;
+                    // EndComposition may synchronously call OnCompositionTerminated. That
+                    // callback has already established the desired None state, so accept its
+                    // generation and continue only with idempotent cleanup.
+                    generation = self.composition_generation()?;
                     selection_index = 0;
                     corresponding_count = 0;
-                    preview.clear();
-                    suffix.clear();
-                    raw_input.clear();
-                    raw_hiragana.clear();
+                    preview = Arc::default();
+                    suffix = Arc::default();
+                    raw_input = Arc::default();
+                    raw_hiragana = Arc::default();
+                    candidates = Arc::default();
                     ipc_service.hide_window()?;
-                    ipc_service.set_candidates(vec![])?;
+                    ipc_service.clear_text()?;
+                }
+                ClientAction::DiscardComposition => {
+                    // Clearing the TSF range before ending commits an empty string. In
+                    // particular, do not call RemoveText here: its response runs an expensive
+                    // conversion whose result is immediately thrown away.
+                    self.set_text("", "")?;
+                    abort_if_reentered!();
+                    self.end_composition()?;
+                    generation = self.composition_generation()?;
+                    selection_index = 0;
+                    corresponding_count = 0;
+                    preview = Arc::default();
+                    suffix = Arc::default();
+                    raw_input = Arc::default();
+                    raw_hiragana = Arc::default();
+                    candidates = Arc::default();
+                    ipc_service.hide_window()?;
                     ipc_service.clear_text()?;
                 }
                 ClientAction::AppendText(text) => {
-                    raw_input.push_str(&text);
-
                     let text = match mode {
                         InputMode::Kana => to_fullwidth(text, false),
                         InputMode::Latin => text.to_string(),
                     };
 
-                    candidates = ipc_service.append_text(text.clone())?;
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
-
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
-
-                    self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
-                }
-                ClientAction::RemoveText => {
-                    candidates = ipc_service.remove_text()?;
-                    let empty = "".to_string();
+                    candidates = Arc::new(ipc_service.append_text(text)?);
+                    selection_index = 0;
                     let text = candidates
                         .texts
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(empty.clone());
+                        .first()
+                        .context("candidate text is empty")?;
                     let sub_text = candidates
                         .sub_texts
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(empty.clone());
-                    let hiragana = candidates.hiragana.clone();
-                    corresponding_count = candidates
+                        .first()
+                        .context("candidate subtext is empty")?;
+                    corresponding_count = *candidates
                         .corresponding_count
-                        .get(selection_index as usize)
-                        .cloned()
-                        .unwrap_or(0);
+                        .first()
+                        .context("candidate corresponding_count is empty")?;
 
-                    raw_input = raw_input
-                        .chars()
-                        .take(corresponding_count as usize)
-                        .collect();
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
+                    self.set_text(text, sub_text)?;
+                    abort_if_reentered!();
+                    preview = Arc::new(text.clone());
+                    suffix = Arc::new(sub_text.clone());
+                    raw_input = Arc::clone(&candidates.raw_input);
+                    raw_hiragana = Arc::clone(&candidates.hiragana);
 
-                    self.set_text(&text, &sub_text)?;
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                    ipc_service.set_candidate_state(&candidates.texts, selection_index)?;
+                }
+                ClientAction::RemoveText => {
+                    candidates = Arc::new(ipc_service.remove_text()?);
+                    selection_index = 0;
+                    let text = candidates.texts.first().map(String::as_str).unwrap_or("");
+                    let sub_text = candidates
+                        .sub_texts
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    corresponding_count = *candidates.corresponding_count.first().unwrap_or(&0);
+
+                    self.set_text(text, sub_text)?;
+                    abort_if_reentered!();
+                    preview = Arc::new(text.to_owned());
+                    suffix = Arc::new(sub_text.to_owned());
+                    raw_input = Arc::clone(&candidates.raw_input);
+                    raw_hiragana = Arc::clone(&candidates.hiragana);
+
+                    ipc_service.set_candidate_state(&candidates.texts, selection_index)?;
                 }
                 ClientAction::MoveCursor(_offset) => {
                     // TODO: I'll use azookey-kkc's composingText
                     // self.set_cursor(offset)?;
                 }
                 ClientAction::SetIMEMode(mode) => {
-                    self.start_composition()?;
-                    self.update_pos()?;
-                    self.end_composition()?;
+                    let tip_exists = {
+                        let text_service = self.borrow()?;
+                        let tip_exists =
+                            text_service.borrow_composition()?.tip_composition.is_some();
+                        tip_exists
+                    };
+                    if tip_exists {
+                        self.end_composition()?;
+                        generation = self.composition_generation()?;
+                    }
 
                     let mut ime_state = IMEState::get()?;
                     ime_state.input_mode = mode.clone();
@@ -448,83 +578,97 @@ impl TextServiceFactory {
 
                     selection_index = 0;
                     corresponding_count = 0;
-                    preview.clear();
-                    suffix.clear();
-                    raw_input.clear();
-                    raw_hiragana.clear();
+                    preview = Arc::default();
+                    suffix = Arc::default();
+                    raw_input = Arc::default();
+                    raw_hiragana = Arc::default();
+                    candidates = Arc::default();
                     ipc_service.clear_text()?;
                 }
                 ClientAction::SetSelection(selection) => {
-                    let candidates = {
-                        let text_service = self.borrow()?;
-                        let composition = text_service.borrow_composition()?.clone();
-                        let candidates = composition.candidates.clone();
-                        candidates
-                    };
-
-                    let texts = candidates.texts.clone();
-                    let sub_texts = candidates.sub_texts.clone();
-
                     selection_index = match selection {
                         SetSelectionType::Up => max(0, selection_index - 1),
-                        SetSelectionType::Down => min(texts.len() as i32 - 1, selection_index + 1),
-                        SetSelectionType::Number(number) => *number,
+                        SetSelectionType::Down => min(
+                            candidates.texts.len().saturating_sub(1) as i32,
+                            selection_index + 1,
+                        ),
+                        SetSelectionType::Number(number) => {
+                            (*number).clamp(0, candidates.texts.len().saturating_sub(1) as i32)
+                        }
                     };
 
-                    ipc_service.set_selection(selection_index as i32)?;
-                    let text = texts[selection_index as usize].clone();
-                    let sub_text = sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
+                    let index = usize::try_from(selection_index).unwrap_or(0);
+                    let text = candidates
+                        .texts
+                        .get(index)
+                        .context("candidate selection is out of range")?;
+                    let sub_text = candidates
+                        .sub_texts
+                        .get(index)
+                        .context("candidate subtext selection is out of range")?;
+                    corresponding_count = *candidates
+                        .corresponding_count
+                        .get(index)
+                        .context("candidate corresponding_count selection is out of range")?;
 
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
-
-                    self.set_text(&text, &sub_text)?;
+                    ipc_service.set_selection(selection_index)?;
+                    self.set_text(text, sub_text)?;
+                    abort_if_reentered!();
+                    preview = Arc::new(text.clone());
+                    suffix = Arc::new(sub_text.clone());
+                    raw_hiragana = Arc::clone(&candidates.hiragana);
                 }
-                ClientAction::ShrinkText(text) => {
-                    // shrink text
-                    raw_input.push_str(&text);
-                    raw_input = raw_input
-                        .chars()
-                        .skip(corresponding_count as usize)
-                        .collect();
+                ClientAction::CommitPrefixAndAppend(text) => {
+                    let displayed_utf16_count =
+                        preview.encode_utf16().count() + suffix.encode_utf16().count();
+                    self.update_context(displayed_utf16_count, &preview)?;
+                    abort_if_reentered!();
 
-                    ipc_service.shrink_text(corresponding_count.clone())?;
                     let text = match mode {
                         InputMode::Kana => to_fullwidth(text, false),
                         InputMode::Latin => text.to_string(),
                     };
-                    candidates = ipc_service.append_text(text)?;
+                    candidates =
+                        Arc::new(ipc_service.commit_prefix_and_append(corresponding_count, text)?);
                     selection_index = 0;
 
-                    let text = candidates.texts[selection_index as usize].clone();
-                    let sub_text = candidates.sub_texts[selection_index as usize].clone();
-                    let hiragana = candidates.hiragana.clone();
-                    self.shift_start(&preview, &text)?;
+                    let text = candidates
+                        .texts
+                        .first()
+                        .context("candidate text is empty")?;
+                    let sub_text = candidates
+                        .sub_texts
+                        .first()
+                        .context("candidate subtext is empty")?;
+                    let replacement_text = candidate_display_text(text, sub_text);
+                    self.shift_start(&preview, &replacement_text)?;
+                    abort_if_reentered!();
 
-                    corresponding_count = candidates.corresponding_count[selection_index as usize];
-                    preview = text.clone();
-                    suffix = sub_text.clone();
-                    raw_hiragana = hiragana.clone();
+                    corresponding_count = *candidates
+                        .corresponding_count
+                        .first()
+                        .context("candidate corresponding_count is empty")?;
+                    preview = Arc::new(text.clone());
+                    suffix = Arc::new(sub_text.clone());
+                    raw_input = Arc::clone(&candidates.raw_input);
+                    raw_hiragana = Arc::clone(&candidates.hiragana);
 
-                    ipc_service.set_candidates(candidates.texts.clone())?;
-                    ipc_service.set_selection(selection_index as i32)?;
+                    ipc_service.set_candidate_state(&candidates.texts, selection_index)?;
                     self.update_pos()?;
+                    abort_if_reentered!();
 
                     transition = CompositionState::Composing;
                 }
                 ClientAction::SetTextWithType(set_type) => {
-                    let text = match set_type {
-                        SetTextType::Hiragana => raw_hiragana.clone(),
-                        SetTextType::Katakana => to_katakana(&raw_hiragana),
-                        SetTextType::HalfKatakana => to_half_katakana(&raw_hiragana),
-                        SetTextType::FullLatin => to_fullwidth(&raw_input, true),
-                        SetTextType::HalfLatin => to_halfwidth(&raw_input),
-                    };
+                    let text = text_with_type(set_type, &raw_input, &raw_hiragana);
+                    let entire_surface_count =
+                        i32::try_from(raw_hiragana.chars().count()).unwrap_or(i32::MAX);
 
                     self.set_text(&text, "")?;
+                    abort_if_reentered!();
+                    preview = Arc::new(text);
+                    suffix = Arc::default();
+                    corresponding_count = entire_surface_count;
                 }
             }
         }
@@ -532,15 +676,84 @@ impl TextServiceFactory {
         let text_service = self.borrow()?;
         let mut composition = text_service.borrow_mut_composition()?;
 
-        composition.preview = preview.clone();
+        if !snapshot_is_current(generation, composition.generation) {
+            drop(composition);
+            drop(text_service);
+            tracing::warn!("Discard stale composition writeback after TSF re-entry");
+            if let Err(error) = ipc_service.hide_window() {
+                tracing::warn!("Failed to hide window after stale writeback: {error:?}");
+            }
+            if let Err(error) = ipc_service.clear_text() {
+                tracing::warn!("Failed to clear server after stale writeback: {error:?}");
+            }
+            return Ok(());
+        }
+
+        composition.preview = preview;
         composition.state = transition;
         composition.selection_index = selection_index;
-        composition.raw_input = raw_input.clone();
-        composition.raw_hiragana = raw_hiragana.clone();
+        composition.raw_input = raw_input;
+        composition.raw_hiragana = raw_hiragana;
         composition.candidates = candidates;
-        composition.suffix = suffix.clone();
+        composition.suffix = suffix;
         composition.corresponding_count = corresponding_count;
+        composition.generation = composition.generation.wrapping_add(1);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        candidate_display_text, is_last_composing_character, snapshot_is_current, text_with_type,
+        SetTextType,
+    };
+
+    #[test]
+    fn last_input_check_handles_multibyte_characters() {
+        assert!(is_last_composing_character(""));
+        assert!(is_last_composing_character("あ"));
+        assert!(!is_last_composing_character("あい"));
+        assert!(!is_last_composing_character("ab"));
+    }
+
+    #[test]
+    fn function_key_text_uses_server_canonical_raw_input() {
+        let raw_input = "kyou";
+        let hiragana = "きょう";
+
+        assert_eq!(
+            text_with_type(&SetTextType::Hiragana, raw_input, hiragana),
+            "きょう"
+        );
+        assert_eq!(
+            text_with_type(&SetTextType::Katakana, raw_input, hiragana),
+            "キョウ"
+        );
+        assert_eq!(
+            text_with_type(&SetTextType::HalfKatakana, raw_input, hiragana),
+            "ｷｮｳ"
+        );
+        assert_eq!(
+            text_with_type(&SetTextType::FullLatin, raw_input, hiragana),
+            "ｋｙｏｕ"
+        );
+        assert_eq!(
+            text_with_type(&SetTextType::HalfLatin, raw_input, hiragana),
+            "kyou"
+        );
+    }
+
+    #[test]
+    fn committed_prefix_replacement_keeps_the_new_suffix_visible() {
+        assert_eq!(candidate_display_text("変換", "のこり"), "変換のこり");
+    }
+
+    #[test]
+    fn nested_termination_invalidates_outer_snapshot() {
+        assert!(snapshot_is_current(7, 7));
+        assert!(!snapshot_is_current(7, 8));
+        assert!(!snapshot_is_current(u64::MAX, 0));
     }
 }

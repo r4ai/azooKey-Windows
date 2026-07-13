@@ -96,6 +96,10 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         display: flex;
                         align-items: center;
                         scroll-snap-align: start;
+                        min-width: 0;
+                        white-space: nowrap;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
 
                         &::before {
                             content: counter(number);
@@ -163,9 +167,11 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         candidates.forEach((candidate, index) => {
                             if (existingItems[index]) {
                                 existingItems[index].textContent = candidate;
+                                existingItems[index].title = candidate;
                             } else {
                                 const li = document.createElement('li');
                                 li.textContent = candidate;
+                                li.title = candidate;
                                 candidateList.appendChild(li);
                             }
                         });
@@ -181,6 +187,10 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         if (selected) {
                             selected.removeAttribute('data-selected');
                         }
+
+                        if (!Number.isInteger(index) || index < 0 || index >= candidateList.children.length) {
+                            return;
+                        }
                         
                         candidateList.children[index].setAttribute('data-selected', '');
                         
@@ -194,6 +204,11 @@ pub fn create_candidate_webview<'a>() -> Result<WebViewBuilder<'a>> {
                         if (index === scrollToIndex || !isElementInView(candidateList.children[index], candidateList)) {
                             candidateList.children[scrollToIndex].scrollIntoView({ behavior: "instant", block: "start", inline: "start" });
                         }
+                    }
+
+                    function updateCandidateState(candidates, index) {
+                        updateCandidates(candidates);
+                        updateSelection(index);
                     }
                     
                     function isElementInView(element, container) {

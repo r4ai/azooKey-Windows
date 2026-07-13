@@ -2,13 +2,27 @@ use windows::{
     core::GUID,
     Win32::{
         Foundation::{BOOL, LPARAM, WPARAM},
-        UI::TextServices::{ITfContext, ITfKeyEventSink_Impl},
+        UI::{
+            Input::KeyboardAndMouse::VK_BACK,
+            TextServices::{ITfContext, ITfKeyEventSink_Impl},
+        },
     },
 };
 
 use anyhow::Result;
+use std::time::Instant;
 
 use super::factory::TextServiceFactory_Impl;
+
+const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
+
+fn is_key_repeat(lparam: LPARAM) -> bool {
+    lparam.0 as usize & PREVIOUS_KEY_STATE_BIT != 0
+}
+
+fn is_backspace(wparam: WPARAM) -> bool {
+    wparam.0 == VK_BACK.0 as usize
+}
 
 // sink (aka event listener) for key events
 impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
@@ -18,8 +32,20 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         &self,
         pic: Option<&ITfContext>,
         wparam: WPARAM,
-        _lparam: LPARAM,
+        lparam: LPARAM,
     ) -> Result<BOOL> {
+        if is_backspace(wparam)
+            && self
+                .borrow()?
+                .backspace_repeat_state
+                .should_suppress(is_key_repeat(lparam), Instant::now())
+        {
+            // Claim queued auto-repeat events even if the previous event ended the
+            // composition. Otherwise the host application can receive the backlog and
+            // unexpectedly delete committed text.
+            return Ok(true.into());
+        }
+
         // this function checks if the key event will be handled by "OnKeyUp" function
         // so we need to return TRUE if we want to handle the key event
         let result = self.process_key(pic, wparam)?.is_some();
@@ -29,10 +55,24 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
 
     #[macros::anyhow]
     #[tracing::instrument]
-    fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
         // this function is called when a key is pressed
         // we can handle key events here
+        if is_backspace(wparam)
+            && self
+                .borrow()?
+                .backspace_repeat_state
+                .should_suppress(is_key_repeat(lparam), Instant::now())
+        {
+            return Ok(true.into());
+        }
+
         let result = self.handle_key(pic, wparam)?;
+        if result && is_backspace(wparam) {
+            self.borrow_mut()?
+                .backspace_repeat_state
+                .mark_handled(Instant::now());
+        }
 
         Ok(result.into())
     }
@@ -65,5 +105,17 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     fn OnSetFocus(&self, _fforeground: BOOL) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_only_the_previous_key_state_bit() {
+        assert!(!is_key_repeat(LPARAM(0)));
+        assert!(!is_key_repeat(LPARAM(1)));
+        assert!(is_key_repeat(LPARAM(PREVIOUS_KEY_STATE_BIT as isize)));
     }
 }

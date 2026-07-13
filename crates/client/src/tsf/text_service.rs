@@ -13,6 +13,26 @@ use anyhow::{Context, Result};
 
 use crate::engine::{composition::Composition, input_mode::InputMode};
 
+const BACKSPACE_REPEAT_COALESCE_WINDOW: Duration = Duration::from_millis(80);
+
+#[derive(Debug, Default)]
+pub struct BackspaceRepeatState {
+    last_handled_at: Option<Instant>,
+}
+
+impl BackspaceRepeatState {
+    pub fn should_suppress(&self, is_repeat: bool, now: Instant) -> bool {
+        is_repeat
+            && self.last_handled_at.is_some_and(|last| {
+                now.saturating_duration_since(last) < BACKSPACE_REPEAT_COALESCE_WINDOW
+            })
+    }
+
+    pub fn mark_handled(&mut self, now: Instant) {
+        self.last_handled_at = Some(now);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpdatePosState {
     #[default]
@@ -72,6 +92,7 @@ pub struct TextService {
     pub context: Option<ITfContext>,
     pub composition: RefCell<Composition>,
     pub update_pos_state: UpdatePosState,
+    pub backspace_repeat_state: BackspaceRepeatState,
     pub display_attribute_atom: HashMap<GUID, u32>,
     pub mode: InputMode,
     pub this: Option<ITfTextInputProcessor>,
@@ -101,5 +122,21 @@ impl TextService {
 
     pub fn borrow_mut_composition(&self) -> Result<RefMut<Composition>> {
         Ok(self.composition.try_borrow_mut()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backspace_repeat_state_only_coalesces_fast_repeats() {
+        let start = Instant::now();
+        let mut state = BackspaceRepeatState::default();
+        state.mark_handled(start);
+
+        assert!(!state.should_suppress(false, start + Duration::from_millis(1)));
+        assert!(state.should_suppress(true, start + Duration::from_millis(79)));
+        assert!(!state.should_suppress(true, start + Duration::from_millis(80)));
     }
 }
