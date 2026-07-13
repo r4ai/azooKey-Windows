@@ -23,12 +23,20 @@ try {
     if (-not (Test-Path -LiteralPath $launcherFullPath -PathType Leaf)) {
         throw "launcher.exe was not found at $launcherFullPath."
     }
+    $launcherDirectory = [IO.Path]::GetDirectoryName($launcherFullPath)
+    if ([string]::IsNullOrWhiteSpace($launcherDirectory) -or
+        -not (Test-Path -LiteralPath $launcherDirectory -PathType Container)) {
+        throw "The launcher directory was not found for $launcherFullPath."
+    }
 
     $launchVbsFullPath = [IO.Path]::GetFullPath($LaunchVbsPath)
     $escapedLauncherPath = $launcherFullPath.Replace('"', '""')
+    $escapedLauncherDirectory = $launcherDirectory.Replace('"', '""')
     $vbsContent = @(
         'Set objShell = CreateObject("WScript.Shell")'
-        ('objShell.Run """{0}""", 0, False' -f $escapedLauncherPath)
+        ('objShell.CurrentDirectory = "{0}"' -f $escapedLauncherDirectory)
+        ('exitCode = objShell.Run("""{0}""", 0, True)' -f $escapedLauncherPath)
+        'WScript.Quit exitCode'
     ) -join "`r`n"
     [IO.File]::WriteAllText(
         $launchVbsFullPath,
@@ -46,6 +54,7 @@ try {
     if (-not $taskXml.Contains("CURRENT_USER_SID") -or
         -not $taskXml.Contains("PATH_TO_VBS") -or
         -not $taskXml.Contains("PATH_TO_WSCRIPT") -or
+        -not $taskXml.Contains("PATH_TO_APP_DIR") -or
         -not $taskXml.Contains('encoding="UTF-8"')) {
         throw "The startup task template is missing a required placeholder or UTF-8 declaration."
     }
@@ -56,9 +65,11 @@ try {
         throw "wscript.exe was not found at $wscriptPath."
     }
     $escapedWscriptPath = [Security.SecurityElement]::Escape($wscriptPath)
+    $escapedLauncherDirectoryXml = [Security.SecurityElement]::Escape($launcherDirectory)
     $taskXml = $taskXml.Replace("CURRENT_USER_SID", $identity.User.Value)
     $taskXml = $taskXml.Replace("PATH_TO_VBS", $escapedLaunchPath)
     $taskXml = $taskXml.Replace("PATH_TO_WSCRIPT", $escapedWscriptPath)
+    $taskXml = $taskXml.Replace("PATH_TO_APP_DIR", $escapedLauncherDirectoryXml)
 
     $taskXml = $taskXml.Replace('encoding="UTF-8"', 'encoding="UTF-16"')
     [IO.File]::WriteAllText(

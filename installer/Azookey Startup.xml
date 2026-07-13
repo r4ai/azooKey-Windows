@@ -43,6 +43,7 @@
     <Exec>
       <Command>PATH_TO_WSCRIPT</Command>
       <Arguments>PATH_TO_VBS</Arguments>
+      <WorkingDirectory>PATH_TO_APP_DIR</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>

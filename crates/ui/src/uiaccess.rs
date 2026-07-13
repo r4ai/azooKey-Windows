@@ -7,7 +7,7 @@ use anyhow::Result;
 use windows::{
     core::PWSTR,
     Win32::{
-        Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE},
+        Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0},
         Security::{
             DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW, PrivilegeCheck,
             SecurityAnonymous, SecurityImpersonation, SetTokenInformation, TokenImpersonation,
@@ -23,8 +23,9 @@ use windows::{
             Environment::GetCommandLineW,
             SystemServices::PRIVILEGE_SET_ALL_NECESSARY,
             Threading::{
-                CreateProcessAsUserW, ExitProcess, GetCurrentProcess, GetStartupInfoW, OpenProcess,
-                OpenProcessToken, SetThreadToken, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+                CreateProcessAsUserW, ExitProcess, GetCurrentProcess, GetExitCodeProcess,
+                GetStartupInfoW, OpenProcess, OpenProcessToken, SetThreadToken,
+                WaitForSingleObject, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
                 PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
             },
         },
@@ -228,8 +229,18 @@ pub fn prepare_uiaccess_token() -> Result<()> {
         )?;
 
         println!("Process created with UIAccess token");
+        // Keep this bootstrap process alive for the lifetime of the UIAccess process. The
+        // launcher supervises this process handle, and uses taskkill /T when the server exits,
+        // so the UIAccess descendant is stopped as part of the same process tree.
+        let wait_result = WaitForSingleObject(process_info.hProcess, INFINITE);
+        anyhow::ensure!(
+            wait_result == WAIT_OBJECT_0,
+            "WaitForSingleObject failed with result {wait_result:?}"
+        );
+        let mut exit_code = 1;
+        GetExitCodeProcess(process_info.hProcess, &mut exit_code)?;
         CloseHandle(process_info.hProcess)?;
         CloseHandle(process_info.hThread)?;
-        ExitProcess(0);
+        ExitProcess(exit_code);
     }
 }
