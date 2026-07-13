@@ -196,6 +196,20 @@ impl UIConnectionState {
         Some(attempt)
     }
 
+    fn reconnect_retry_delay(&self, now: Instant) -> Duration {
+        if self.active_attempt.is_some() {
+            return UI_RECONNECT_RETRY_INTERVAL;
+        }
+
+        self.last_attempt
+            .map(|last_attempt| {
+                UI_RECONNECT_RETRY_INTERVAL
+                    .saturating_sub(now.saturating_duration_since(last_attempt))
+            })
+            .unwrap_or_default()
+            .max(PIPE_RETRY_INTERVAL)
+    }
+
     fn finish_reconnect(&mut self, attempt: UIReconnectAttempt, client: Option<UIChannel>) -> bool {
         if self.active_attempt != Some(attempt) {
             return false;
@@ -419,6 +433,7 @@ struct UIActorContext {
 
 enum UIDrainStep {
     Stop,
+    RetryAfter(Duration),
     Reconnect(UIReconnectAttempt),
     Rpc(UIWork),
 }
@@ -687,11 +702,11 @@ impl UIActorContext {
             return UIDrainStep::Stop;
         };
         let Some(channel) = state.client.as_ref() else {
-            let Some(attempt) = state.begin_reconnect(Instant::now()) else {
-                self.scheduled.store(false, Ordering::Release);
-                return UIDrainStep::Stop;
-            };
-            return UIDrainStep::Reconnect(attempt);
+            let now = Instant::now();
+            return state.begin_reconnect(now).map_or_else(
+                || UIDrainStep::RetryAfter(state.reconnect_retry_delay(now)),
+                UIDrainStep::Reconnect,
+            );
         };
 
         UIDrainStep::Rpc(UIWork {
@@ -806,6 +821,7 @@ impl UIActorContext {
         loop {
             match self.next_step() {
                 UIDrainStep::Stop => return,
+                UIDrainStep::RetryAfter(delay) => time::sleep(delay).await,
                 UIDrainStep::Reconnect(attempt) => {
                     self.reconnect(attempt).await;
                 }
@@ -830,8 +846,8 @@ impl UIActorContext {
                         );
                     }
                     if invalidated {
-                        // The next loop observes the missing client, clears the scheduled flag,
-                        // and launches at most one throttled reconnect task.
+                        // The next loop observes the missing client and keeps the desired state
+                        // scheduled while reconnect attempts are throttled.
                         continue;
                     }
                 }
@@ -1015,6 +1031,42 @@ mod tests {
         assert_ne!(first, second);
         assert!(!state.finish_reconnect(first, None));
         assert_eq!(state.active_attempt, Some(second));
+    }
+
+    #[test]
+    fn throttled_ui_reconnect_retains_a_delayed_wake() {
+        let now = Instant::now();
+        let mut state = UIConnectionState::default();
+        state.set_visible(true);
+        let first = state.begin_reconnect(now).unwrap();
+        assert!(!state.finish_reconnect(first, None));
+
+        let before_retry = now + Duration::from_millis(100);
+        assert!(state.begin_reconnect(before_retry).is_none());
+        assert_eq!(
+            state.reconnect_retry_delay(before_retry),
+            Duration::from_millis(400)
+        );
+        assert!(state
+            .begin_reconnect(now + UI_RECONNECT_RETRY_INTERVAL)
+            .is_some());
+
+        state.active_attempt = None;
+        state.last_attempt = Some(Instant::now());
+        let identity = Arc::new(ConnectionIdentity::new());
+        identity.activate();
+        let scheduled = Arc::new(AtomicBool::new(true));
+        let actor = UIActorContext {
+            identity,
+            connection: Arc::new(Mutex::new(state)),
+            scheduled: Arc::clone(&scheduled),
+        };
+        let UIDrainStep::RetryAfter(delay) = actor.next_step() else {
+            panic!("throttled reconnect must retain a delayed drain");
+        };
+        assert!(delay >= PIPE_RETRY_INTERVAL);
+        assert!(delay <= UI_RECONNECT_RETRY_INTERVAL);
+        assert!(scheduled.load(Ordering::Acquire));
     }
 
     #[test]
