@@ -15,7 +15,7 @@ use windows::{
 
 use crate::engine::state::IMEState;
 
-use super::{edit_session::edit_session, factory::TextServiceFactory};
+use super::{edit_session::sync_read_edit_session, factory::TextServiceFactory};
 
 impl TextServiceFactory {
     fn to_parent_document_if_exists(
@@ -117,13 +117,14 @@ impl TextServiceFactory {
         committed_text: &str,
     ) -> Result<()> {
         let result: Result<()> = (|| unsafe {
-            let text_service = self.borrow()?;
-
-            let context = text_service.context::<ITfContext>()?;
+            let (tid, context) = {
+                let text_service = self.borrow()?;
+                (text_service.tid, text_service.context::<ITfContext>()?)
+            };
             let parent_context = self.to_parent_context_if_exists(Some(context))?;
 
-            let preceding_text = edit_session::<String>(
-                text_service.tid,
+            let mut preceding_text = sync_read_edit_session::<String>(
+                tid,
                 parent_context.clone(),
                 Rc::new({
                     let composition_utf16_count =
@@ -186,10 +187,6 @@ impl TextServiceFactory {
                     }
                 }),
             )?;
-
-            let Some(mut preceding_text) = preceding_text else {
-                return Ok(());
-            };
 
             preceding_text.push_str(committed_text);
 
