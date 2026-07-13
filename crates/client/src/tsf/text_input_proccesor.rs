@@ -218,7 +218,22 @@ impl TextServiceFactory {
             return Ok(());
         }
 
+        if let Some(mut ipc_service) = IMEState::ipc_snapshot() {
+            // Some hosts do not send OnCompositionTerminated after a successful EndComposition.
+            // Do not perform conversion IPC during Deactivate; make the next focused stateful
+            // request lazily reset the server session, and hide the optional UI best-effort.
+            ipc_service.mark_server_session_dirty();
+            if let Err(error) = ipc_service.hide_window() {
+                tracing::warn!("Failed to queue candidate-window hide during teardown: {error:?}");
+            }
+        }
+
         let mut text_service = self.borrow_mut()?;
+        // EndComposition is allowed to succeed without a synchronous termination callback.
+        // Once all TSF registrations and the DLL reference are gone, no live range remains;
+        // clear every local preedit field so a later Activate cannot inherit stale state. A late
+        // callback performs the same reset again and merely advances the generation once more.
+        text_service.borrow_mut_composition()?.reset();
         text_service.display_attribute_atom.clear();
         text_service.context = None;
         text_service.thread_mgr_event_cookie = None;
@@ -229,6 +244,7 @@ impl TextServiceFactory {
         text_service.open_close_cookie = None;
         text_service.conversion_mode_cookie = None;
         text_service.pending_input_mode_transition.set(None);
+        text_service.pending_composition_cleanup.set(false);
         text_service.compartment_write_in_progress = false;
         text_service.tid = 0;
         text_service.thread_mgr = None;
@@ -244,19 +260,16 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
 
         // IPC startup is best-effort. The launcher, server, and host process can race during
         // login/install, but that must not leave a selected TIP without its key/TSF sinks.
-        let ipc_is_ready = IMEState::get()
-            .map(|state| state.ipc_service.is_some())
-            .unwrap_or(false);
+        let ipc_is_ready = IMEState::ipc_snapshot().is_some();
         if !ipc_is_ready {
-            let ipc_result = (|| -> Result<ipc_service::IPCService> {
-                let mut ipc_service = ipc_service::IPCService::new()?;
-                ipc_service.append_text(String::new())?;
-                Ok(ipc_service)
-            })();
+            // A successful transport connection is enough to publish the client. Do not probe
+            // with AppendText/ClearText here: the converter state is process-global and belongs
+            // to whichever focused TIP issues the next stateful request.
+            let ipc_result = ipc_service::IPCService::new();
 
             match ipc_result {
-                Ok(ipc_service) => match IMEState::get() {
-                    Ok(mut state) => state.ipc_service = Some(ipc_service),
+                Ok(ipc_service) => match IMEState::install_ipc_if_absent(ipc_service) {
+                    Ok(_) => {}
                     Err(error) => {
                         tracing::warn!("Failed to store initialized IPC service: {error:?}");
                         if let Err(error) = IMEState::start_ipc_reconnect() {

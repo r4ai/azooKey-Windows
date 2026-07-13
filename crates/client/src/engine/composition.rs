@@ -83,6 +83,38 @@ fn input_mode_transition(
     (next_state, vec![ClientAction::SetIMEMode(requested_mode)])
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ActionProgress {
+    started_composition: bool,
+    visible_or_committed_effect: bool,
+    must_eat_on_failure: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedKeyDisposition {
+    PassThrough,
+    Eat,
+}
+
+enum ActionExecution {
+    Applied,
+    Failed {
+        error: anyhow::Error,
+        disposition: FailedKeyDisposition,
+    },
+}
+
+fn failed_key_disposition(
+    progress: ActionProgress,
+    cleanup_succeeded: bool,
+) -> FailedKeyDisposition {
+    if !cleanup_succeeded || progress.visible_or_committed_effect || progress.must_eat_on_failure {
+        FailedKeyDisposition::Eat
+    } else {
+        FailedKeyDisposition::PassThrough
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct Composition {
     // These strings are snapshotted while synchronous RPC/TSF calls run. Arc keeps that
@@ -101,6 +133,21 @@ pub struct Composition {
     pub state: CompositionState,
     pub tip_composition: Option<ITfComposition>,
     pub generation: u64,
+}
+
+impl Composition {
+    pub(crate) fn reset(&mut self) {
+        self.preview = Arc::default();
+        self.suffix = Arc::default();
+        self.raw_input = Arc::default();
+        self.raw_hiragana = Arc::default();
+        self.corresponding_count = 0;
+        self.selection_index = 0;
+        self.candidates = Arc::default();
+        self.state = CompositionState::None;
+        self.tip_composition = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
 }
 
 impl ITfCompositionSink_Impl for TextServiceFactory_Impl {
@@ -130,28 +177,15 @@ impl TextServiceFactory {
         {
             let text_service = self.borrow()?;
             let mut composition = text_service.borrow_mut_composition()?;
-            composition.preview = Arc::default();
-            composition.suffix = Arc::default();
-            composition.raw_input = Arc::default();
-            composition.raw_hiragana = Arc::default();
-            composition.corresponding_count = 0;
-            composition.selection_index = 0;
-            composition.candidates = Arc::default();
-            composition.state = CompositionState::None;
-            composition.tip_composition = None;
-            composition.generation = composition.generation.wrapping_add(1);
+            composition.reset();
         }
-        self.borrow()?.pending_input_mode_transition.set(None);
+        {
+            let text_service = self.borrow()?;
+            text_service.pending_input_mode_transition.set(None);
+            text_service.pending_composition_cleanup.set(false);
+        }
 
-        let ipc_service = match IMEState::get() {
-            Ok(state) => state.ipc_service.clone(),
-            Err(error) => {
-                tracing::warn!(
-                    "Failed to get IPC service after composition termination: {error:?}"
-                );
-                None
-            }
-        };
+        let ipc_service = IMEState::ipc_snapshot();
         if let Some(mut ipc_service) = ipc_service {
             if let Err(error) = ipc_service.hide_window() {
                 tracing::warn!("Failed to hide candidate window after termination: {error:?}");
@@ -166,6 +200,66 @@ impl TextServiceFactory {
 
     pub fn has_pending_input_mode_transition(&self) -> Result<bool> {
         Ok(self.borrow()?.pending_input_mode_transition.get().is_some())
+    }
+
+    pub fn has_pending_key_cleanup(&self) -> Result<bool> {
+        let text_service = self.borrow()?;
+        Ok(text_service.pending_composition_cleanup.get()
+            || text_service.pending_input_mode_transition.get().is_some())
+    }
+
+    fn finish_pending_composition_cleanup(&self) -> Result<()> {
+        if !self.borrow()?.pending_composition_cleanup.get() {
+            return Ok(());
+        }
+
+        self.end_composition()?;
+        self.borrow()?.pending_composition_cleanup.set(true);
+        let still_active = {
+            let text_service = self.borrow()?;
+            let composition = text_service.borrow_composition()?;
+            composition.tip_composition.is_some() || composition.state != CompositionState::None
+        };
+        if still_active {
+            self.handle_composition_terminated()?;
+        } else {
+            self.borrow()?.pending_composition_cleanup.set(false);
+        }
+        Ok(())
+    }
+
+    fn recover_failed_action(&self, started_composition: bool) -> Result<()> {
+        // Arm the retry before any borrow or COM call below can fail. It is cleared only after
+        // local TSF state is known to be consistent again.
+        self.borrow()?.pending_composition_cleanup.set(true);
+        let has_active_composition = {
+            let text_service = self.borrow()?;
+            let composition = text_service.borrow_composition()?;
+            composition.tip_composition.is_some() || composition.state != CompositionState::None
+        };
+
+        if has_active_composition || started_composition {
+            self.end_composition()
+                .context("failed to commit composition after action error")?;
+            // A synchronous OnCompositionTerminated callback clears the flag as part of its
+            // normal reset. Re-arm it until the fallback consistency check below has completed.
+            self.borrow()?.pending_composition_cleanup.set(true);
+
+            // Some hosts do not synchronously call OnCompositionTerminated. Complete the same
+            // idempotent reset after EndComposition has succeeded.
+            let still_active = {
+                let text_service = self.borrow()?;
+                let composition = text_service.borrow_composition()?;
+                composition.tip_composition.is_some() || composition.state != CompositionState::None
+            };
+            if still_active {
+                self.handle_composition_terminated()
+                    .context("failed to reset composition after action error")?;
+            }
+        }
+
+        self.borrow()?.pending_composition_cleanup.set(false);
+        Ok(())
     }
 
     /// Applies an external TSF mode transition at the first real key-processing safe point.
@@ -206,17 +300,13 @@ impl TextServiceFactory {
             return Ok(None);
         };
 
-        // check shortcut keys
-        if VK_CONTROL.is_pressed() {
-            return Ok(None);
-        }
-
-        let (composition_state, is_last_input, suffix_is_empty, mode) = {
+        let (composition_state, tip_exists, is_last_input, suffix_is_empty, mode) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?;
             let mode = text_service.mode.get();
             (
                 composition.state,
+                composition.tip_composition.is_some(),
                 is_last_composing_character(&composition.raw_hiragana),
                 composition.suffix.is_empty(),
                 mode,
@@ -226,8 +316,9 @@ impl TextServiceFactory {
         let action = UserAction::try_from(wparam.0)?;
 
         // Activation is intentionally allowed to complete without IPC so the TIP remains
-        // selectable during launcher/server startup races. Until a background reconnect has
-        // succeeded, only mode keys are consumed; ordinary text must reach the host unchanged.
+        // selectable during launcher/server startup races. If a composition was already active
+        // when IPC disappeared, claim one key to end it locally instead of letting the host edit
+        // underneath stale preedit. With no active composition, ordinary text passes through.
         let ipc_available = IMEState::ipc_available_or_start_reconnect();
         if !ipc_available
             && !matches!(
@@ -235,6 +326,19 @@ impl TextServiceFactory {
                 UserAction::SetInputMode(_) | UserAction::ToggleInputMode
             )
         {
+            return if tip_exists || composition_state != CompositionState::None {
+                Ok(Some((
+                    vec![ClientAction::EndComposition],
+                    CompositionState::None,
+                )))
+            } else {
+                Ok(None)
+            };
+        }
+
+        // Normal shortcuts pass through, but an offline active composition above must first be
+        // claimed and ended so the host cannot edit underneath stale preedit.
+        if VK_CONTROL.is_pressed() {
             return Ok(None);
         }
 
@@ -450,37 +554,42 @@ impl TextServiceFactory {
             return Ok(false);
         };
 
+        if let Err(error) = self.finish_pending_composition_cleanup() {
+            // The previous failure may have left a live TSF range. Keep claiming keys until it
+            // can be ended; passing this key to the host could edit underneath that range.
+            tracing::warn!("Failed to finish pending composition cleanup: {error:?}");
+            return Ok(true);
+        }
+
         if let Err(error) = self.finish_pending_input_mode_transition() {
-            // OnTestKeyDown deliberately claimed this key to reach this safe point. Returning
-            // not-eaten lets the host handle it and preserves the pending transition for retry.
+            // Keep the pending transition for the next key. Passing this key to the host while
+            // the old TIP composition is still active would mix host input with stale preedit.
             tracing::warn!("Failed to finish pending input-mode transition: {error:?}");
-            return Ok(false);
+            return Ok(true);
         }
 
         // A reconnect creates a fresh UI channel whose deduplication cache is empty. Synchronize
         // the per-TextService mode immediately before the first handled key, without making UI
         // availability a prerequisite for TSF mode keys.
         let mode = self.borrow()?.mode.get();
-        let ipc_service = match IMEState::get() {
-            Ok(state) => state.ipc_service.clone(),
-            Err(error) => {
-                tracing::warn!("Failed to read IPC state before key handling: {error:?}");
-                None
-            }
-        };
+        let ipc_service = IMEState::ipc_snapshot();
         if let Some(mut ipc_service) = ipc_service {
             if let Err(error) = ipc_service.set_input_mode(mode.indicator()) {
                 tracing::warn!("Failed to synchronize candidate UI input mode: {error:?}");
             }
         }
 
-        if let Some((actions, transition)) = self.process_key(context, wparam)? {
-            self.handle_action(&actions, transition)?;
-        } else {
+        let Some((actions, transition)) = self.process_key(context, wparam)? else {
             return Ok(false);
-        }
+        };
 
-        Ok(true)
+        match self.execute_actions(&actions, transition) {
+            ActionExecution::Applied => Ok(true),
+            ActionExecution::Failed { error, disposition } => {
+                tracing::warn!("Failed to handle key action: {error:?}");
+                Ok(disposition == FailedKeyDisposition::Eat)
+            }
+        }
     }
 
     #[tracing::instrument]
@@ -488,6 +597,45 @@ impl TextServiceFactory {
         &self,
         actions: &[ClientAction],
         transition: CompositionState,
+    ) -> Result<()> {
+        match self.execute_actions(actions, transition) {
+            ActionExecution::Applied => Ok(()),
+            ActionExecution::Failed { error, .. } => Err(error),
+        }
+    }
+
+    fn execute_actions(
+        &self,
+        actions: &[ClientAction],
+        transition: CompositionState,
+    ) -> ActionExecution {
+        let mut progress = ActionProgress::default();
+        match self.handle_action_inner(actions, transition, &mut progress) {
+            Ok(()) => ActionExecution::Applied,
+            Err(error) => {
+                let cleanup_succeeded =
+                    match self.recover_failed_action(progress.started_composition) {
+                        Ok(()) => true,
+                        Err(cleanup_error) => {
+                            tracing::warn!(
+                            "Failed to clean up composition after action error: {cleanup_error:?}"
+                        );
+                            false
+                        }
+                    };
+                ActionExecution::Failed {
+                    error,
+                    disposition: failed_key_disposition(progress, cleanup_succeeded),
+                }
+            }
+        }
+    }
+
+    fn handle_action_inner(
+        &self,
+        actions: &[ClientAction],
+        transition: CompositionState,
+        progress: &mut ActionProgress,
     ) -> Result<()> {
         let (
             mut preview,
@@ -515,13 +663,7 @@ impl TextServiceFactory {
                 mode,
             )
         };
-        let mut ipc_service = match IMEState::get() {
-            Ok(state) => state.ipc_service.clone(),
-            Err(error) => {
-                tracing::warn!("Failed to read optional IPC service: {error:?}");
-                None
-            }
-        };
+        let mut ipc_service = IMEState::ipc_snapshot();
         let mut transition = transition;
         macro_rules! require_ipc_service {
             () => {
@@ -553,12 +695,15 @@ impl TextServiceFactory {
                     self.update_context(0, "")?;
                     abort_if_reentered!();
                     self.start_composition()?;
+                    progress.started_composition = true;
                     abort_if_reentered!();
                     self.update_pos()?;
                     abort_if_reentered!();
                 }
                 ClientAction::EndComposition => {
+                    progress.must_eat_on_failure = true;
                     self.end_composition()?;
+                    progress.visible_or_committed_effect = true;
                     // EndComposition may synchronously call OnCompositionTerminated. That
                     // callback has already established the desired None state, so accept its
                     // generation and continue only with idempotent cleanup.
@@ -576,12 +721,15 @@ impl TextServiceFactory {
                     }
                 }
                 ClientAction::DiscardComposition => {
+                    progress.must_eat_on_failure = true;
                     // Clearing the TSF range before ending commits an empty string. In
                     // particular, do not call RemoveText here: its response runs an expensive
                     // conversion whose result is immediately thrown away.
                     self.set_text("", "")?;
+                    progress.visible_or_committed_effect = true;
                     abort_if_reentered!();
                     self.end_composition()?;
+                    progress.visible_or_committed_effect = true;
                     generation = self.composition_generation()?;
                     selection_index = 0;
                     corresponding_count = 0;
@@ -617,6 +765,7 @@ impl TextServiceFactory {
                         .context("candidate corresponding_count is empty")?;
 
                     self.set_text(text, sub_text)?;
+                    progress.visible_or_committed_effect = true;
                     abort_if_reentered!();
                     preview = Arc::new(text.clone());
                     suffix = Arc::new(sub_text.clone());
@@ -638,6 +787,7 @@ impl TextServiceFactory {
                     corresponding_count = *candidates.corresponding_count.first().unwrap_or(&0);
 
                     self.set_text(text, sub_text)?;
+                    progress.visible_or_committed_effect = true;
                     abort_if_reentered!();
                     preview = Arc::new(text.to_owned());
                     suffix = Arc::new(sub_text.to_owned());
@@ -652,6 +802,7 @@ impl TextServiceFactory {
                     // self.set_cursor(offset)?;
                 }
                 ClientAction::SetIMEMode(requested_mode) => {
+                    progress.must_eat_on_failure = true;
                     let requested_change = mode != *requested_mode;
                     let tip_exists = {
                         let text_service = self.borrow()?;
@@ -661,6 +812,7 @@ impl TextServiceFactory {
                     };
                     if requested_change && tip_exists {
                         self.end_composition()?;
+                        progress.visible_or_committed_effect = true;
                         generation = self.composition_generation()?;
                     }
 
@@ -721,6 +873,7 @@ impl TextServiceFactory {
 
                     require_ipc_service!().set_selection(selection_index)?;
                     self.set_text(text, sub_text)?;
+                    progress.visible_or_committed_effect = true;
                     abort_if_reentered!();
                     preview = Arc::new(text.clone());
                     suffix = Arc::new(sub_text.clone());
@@ -750,6 +903,7 @@ impl TextServiceFactory {
                         .context("candidate subtext is empty")?;
                     let replacement_text = candidate_display_text(text, sub_text);
                     self.shift_start(&preview, &replacement_text)?;
+                    progress.visible_or_committed_effect = true;
                     abort_if_reentered!();
 
                     corresponding_count = *candidates
@@ -774,6 +928,7 @@ impl TextServiceFactory {
                         i32::try_from(raw_hiragana.chars().count()).unwrap_or(i32::MAX);
 
                     self.set_text(&text, "")?;
+                    progress.visible_or_committed_effect = true;
                     abort_if_reentered!();
                     preview = Arc::new(text);
                     suffix = Arc::default();
@@ -817,10 +972,12 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_display_text, displayed_utf16_count, input_mode_transition,
-        is_last_composing_character, snapshot_is_current, text_with_type, ClientAction,
-        CompositionState, InputMode, SetTextType,
+        candidate_display_text, displayed_utf16_count, failed_key_disposition,
+        input_mode_transition, is_last_composing_character, snapshot_is_current, text_with_type,
+        ActionProgress, ClientAction, Composition, CompositionState, FailedKeyDisposition,
+        InputMode, SetTextType,
     };
+    use std::sync::Arc;
 
     #[test]
     fn last_input_check_handles_multibyte_characters() {
@@ -875,6 +1032,33 @@ mod tests {
     }
 
     #[test]
+    fn local_reset_clears_stale_preedit_and_advances_generation() {
+        let mut composition = Composition {
+            preview: Arc::new("変換".to_owned()),
+            suffix: Arc::new("中".to_owned()),
+            raw_input: Arc::new("henkann".to_owned()),
+            raw_hiragana: Arc::new("へんかん".to_owned()),
+            corresponding_count: 4,
+            selection_index: 2,
+            state: CompositionState::Composing,
+            generation: u64::MAX,
+            ..Composition::default()
+        };
+
+        composition.reset();
+
+        assert!(composition.preview.is_empty());
+        assert!(composition.suffix.is_empty());
+        assert!(composition.raw_input.is_empty());
+        assert!(composition.raw_hiragana.is_empty());
+        assert_eq!(composition.corresponding_count, 0);
+        assert_eq!(composition.selection_index, 0);
+        assert_eq!(composition.state, CompositionState::None);
+        assert!(composition.tip_composition.is_none());
+        assert_eq!(composition.generation, 0);
+    }
+
+    #[test]
     fn changing_input_mode_ends_the_composition_state() {
         let (state, actions) = input_mode_transition(
             CompositionState::Composing,
@@ -896,5 +1080,52 @@ mod tests {
 
         assert_eq!(state, CompositionState::Composing);
         assert_eq!(actions, [ClientAction::SetIMEMode(InputMode::Kana)]);
+    }
+
+    #[test]
+    fn failed_action_passes_through_only_after_no_effect_cleanup() {
+        assert_eq!(
+            failed_key_disposition(ActionProgress::default(), true),
+            FailedKeyDisposition::PassThrough
+        );
+
+        assert_eq!(
+            failed_key_disposition(
+                ActionProgress {
+                    started_composition: true,
+                    ..ActionProgress::default()
+                },
+                true,
+            ),
+            FailedKeyDisposition::PassThrough
+        );
+    }
+
+    #[test]
+    fn failed_action_is_eaten_after_effect_or_failed_cleanup() {
+        assert_eq!(
+            failed_key_disposition(
+                ActionProgress {
+                    visible_or_committed_effect: true,
+                    ..ActionProgress::default()
+                },
+                true,
+            ),
+            FailedKeyDisposition::Eat
+        );
+        assert_eq!(
+            failed_key_disposition(
+                ActionProgress {
+                    must_eat_on_failure: true,
+                    ..ActionProgress::default()
+                },
+                true,
+            ),
+            FailedKeyDisposition::Eat
+        );
+        assert_eq!(
+            failed_key_disposition(ActionProgress::default(), false),
+            FailedKeyDisposition::Eat
+        );
     }
 }

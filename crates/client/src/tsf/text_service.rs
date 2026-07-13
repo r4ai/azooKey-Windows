@@ -136,6 +136,7 @@ pub struct TextService {
     pub conversion_mode_cookie: Option<u32>,
     pub compartment_write_in_progress: bool,
     pub pending_input_mode_transition: Cell<Option<PendingInputModeTransition>>,
+    pub pending_composition_cleanup: Cell<bool>,
     pub this: Option<ITfTextInputProcessor>,
 }
 

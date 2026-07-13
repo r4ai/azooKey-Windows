@@ -190,7 +190,7 @@ impl TextServiceFactory {
 
             preceding_text.push_str(committed_text);
 
-            let Some(mut ipc_service) = IMEState::get()?.ipc_service.clone() else {
+            let Some(mut ipc_service) = IMEState::ipc_snapshot() else {
                 return Ok(());
             };
 

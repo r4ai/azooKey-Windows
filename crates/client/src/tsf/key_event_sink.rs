@@ -24,8 +24,8 @@ fn is_backspace(wparam: WPARAM) -> bool {
     wparam.0 == VK_BACK.0 as usize
 }
 
-fn should_claim_pending_transition(has_context: bool, has_pending_transition: bool) -> bool {
-    has_context && has_pending_transition
+fn should_claim_pending_cleanup(has_context: bool, has_pending_cleanup: bool) -> bool {
+    has_context && has_pending_cleanup
 }
 
 // sink (aka event listener) for key events
@@ -50,11 +50,9 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
             return Ok(true.into());
         }
 
-        // External compartment changes are finalized only from the real OnKeyDown safe point.
-        // Claim one test event so handle_key can end the old composition and then classify this
-        // same key again under the new mode.
-        if should_claim_pending_transition(pic.is_some(), self.has_pending_input_mode_transition()?)
-        {
+        // Composition recovery and external compartment changes are finalized only from the
+        // real OnKeyDown safe point. Claim one test event so handle_key can safely retry them.
+        if should_claim_pending_cleanup(pic.is_some(), self.has_pending_key_cleanup()?) {
             return Ok(true.into());
         }
 
@@ -132,9 +130,9 @@ mod tests {
     }
 
     #[test]
-    fn pending_transition_is_claimed_before_ipc_key_classification() {
-        assert!(should_claim_pending_transition(true, true));
-        assert!(!should_claim_pending_transition(true, false));
-        assert!(!should_claim_pending_transition(false, true));
+    fn pending_cleanup_is_claimed_before_ipc_key_classification() {
+        assert!(should_claim_pending_cleanup(true, true));
+        assert!(!should_claim_pending_cleanup(true, false));
+        assert!(!should_claim_pending_cleanup(false, true));
     }
 }

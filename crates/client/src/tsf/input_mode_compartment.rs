@@ -348,13 +348,7 @@ impl TextServiceFactory {
             tracing::warn!("Failed to update language bar input mode: {error:?}");
         }
 
-        let ipc_service = match IMEState::get() {
-            Ok(state) => state.ipc_service.clone(),
-            Err(error) => {
-                tracing::warn!("Failed to read optional IPC service: {error:?}");
-                None
-            }
-        };
+        let ipc_service = IMEState::ipc_snapshot();
         if let Some(mut ipc_service) = ipc_service {
             if let Err(error) = ipc_service.set_input_mode(mode.indicator()) {
                 tracing::warn!("Failed to update candidate UI input mode: {error:?}");

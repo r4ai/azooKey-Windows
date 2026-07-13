@@ -8,20 +8,23 @@ use super::ipc_service::IPCService;
 const IPC_RECONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 fn reconnect_is_due(
-    reconnect_in_progress: bool,
+    active_attempt_id: Option<u64>,
     last_attempt: Option<Instant>,
     now: Instant,
+    force: bool,
 ) -> bool {
-    !reconnect_in_progress
-        && last_attempt.is_none_or(|last_attempt| {
-            now.saturating_duration_since(last_attempt) >= IPC_RECONNECT_RETRY_INTERVAL
-        })
+    active_attempt_id.is_none()
+        && (force
+            || last_attempt.is_none_or(|last_attempt| {
+                now.saturating_duration_since(last_attempt) >= IPC_RECONNECT_RETRY_INTERVAL
+            }))
 }
 
 #[derive(Debug)]
 pub struct IMEState {
     pub ipc_service: Option<IPCService>,
-    ipc_reconnect_in_progress: bool,
+    active_ipc_reconnect_attempt: Option<u64>,
+    next_ipc_reconnect_attempt: u64,
     last_ipc_reconnect_attempt: Option<Instant>,
 }
 
@@ -29,7 +32,8 @@ pub static IME_STATE: LazyLock<Mutex<IMEState>> = LazyLock::new(|| {
     tracing::debug!("Creating IMEState");
     Mutex::new(IMEState {
         ipc_service: None,
-        ipc_reconnect_in_progress: false,
+        active_ipc_reconnect_attempt: None,
+        next_ipc_reconnect_attempt: 0,
         last_ipc_reconnect_attempt: None,
     })
 });
@@ -37,26 +41,69 @@ unsafe impl Sync for IMEState {}
 unsafe impl Send for IMEState {}
 
 impl IMEState {
-    pub fn get() -> anyhow::Result<MutexGuard<'static, IMEState>> {
-        match IME_STATE.try_lock() {
-            Ok(guard) => Ok(guard),
-            Err(e) => anyhow::bail!("Failed to lock state: {:?}", e),
+    fn lock_blocking() -> MutexGuard<'static, IMEState> {
+        IME_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Clones the currently published active connection while holding the global mutex only for
+    /// the clone. Key processing must not interpret a transient `try_lock` collision as an IPC
+    /// outage, and no RPC is ever issued while this mutex is held.
+    pub fn ipc_snapshot() -> Option<IPCService> {
+        Self::lock_blocking()
+            .ipc_service
+            .as_ref()
+            .filter(|service| service.is_active())
+            .cloned()
+    }
+
+    /// Installs one freshly connected service without replacing a newer connection. The
+    /// connection becomes usable only while it is the service stored in this state.
+    pub fn install_ipc_if_absent(ipc_service: IPCService) -> anyhow::Result<bool> {
+        let mut state = Self::lock_blocking();
+        if state.ipc_service.is_some() {
+            return Ok(false);
+        }
+
+        ipc_service.activate();
+        state.ipc_service = Some(ipc_service);
+        Ok(true)
+    }
+
+    /// Removes exactly the connection that reported a failure. A delayed error from an old
+    /// clone cannot invalidate a newer service with a different connection id.
+    pub fn invalidate_ipc(connection_id: u64) {
+        let removed = {
+            let mut state = Self::lock_blocking();
+            let is_current = state
+                .ipc_service
+                .as_ref()
+                .is_some_and(|service| service.connection_id() == connection_id);
+            if is_current {
+                let service = state.ipc_service.take();
+                if let Some(service) = service.as_ref() {
+                    service.deactivate();
+                }
+                service
+            } else {
+                None
+            }
+        };
+
+        if removed.is_some() {
+            // Drop the Tokio runtime/channel clone outside the global state mutex.
+            drop(removed);
+            if let Err(error) = Self::start_ipc_reconnect_inner(true) {
+                tracing::warn!("Failed to schedule IPC reconnect after invalidation: {error:?}");
+            }
         }
     }
 
     /// Returns whether conversion IPC is ready. If it is not, starts one throttled background
-    /// connection attempt and immediately returns false so the TSF key test can pass ordinary
-    /// input through to the host application.
+    /// connection attempt and immediately returns false so ordinary input can remain responsive.
     pub fn ipc_available_or_start_reconnect() -> bool {
-        let available = match Self::get() {
-            Ok(state) => state.ipc_service.is_some(),
-            Err(error) => {
-                tracing::warn!("Failed to inspect IPC reconnect state: {error:?}");
-                return false;
-            }
-        };
-
-        if available {
+        if Self::ipc_snapshot().is_some() {
             return true;
         }
 
@@ -67,63 +114,76 @@ impl IMEState {
     }
 
     pub fn start_ipc_reconnect() -> anyhow::Result<()> {
+        Self::start_ipc_reconnect_inner(false)
+    }
+
+    fn start_ipc_reconnect_inner(force: bool) -> anyhow::Result<()> {
         let now = Instant::now();
-        let should_start = {
-            let mut state = Self::get()?;
+        let attempt_id = {
+            let mut state = Self::lock_blocking();
             if state.ipc_service.is_some()
                 || !reconnect_is_due(
-                    state.ipc_reconnect_in_progress,
+                    state.active_ipc_reconnect_attempt,
                     state.last_ipc_reconnect_attempt,
                     now,
+                    force,
                 )
             {
-                false
+                None
             } else {
-                state.ipc_reconnect_in_progress = true;
+                state.next_ipc_reconnect_attempt = state.next_ipc_reconnect_attempt.wrapping_add(1);
+                let attempt_id = state.next_ipc_reconnect_attempt;
+                state.active_ipc_reconnect_attempt = Some(attempt_id);
                 state.last_ipc_reconnect_attempt = Some(now);
-                true
+                Some(attempt_id)
             }
         };
 
-        if !should_start {
+        let Some(attempt_id) = attempt_id else {
             return Ok(());
-        }
+        };
 
         let spawn_result = std::thread::Builder::new()
             .name("azookey-ipc-reconnect".to_owned())
-            .spawn(|| {
-                let connection_result = (|| -> anyhow::Result<IPCService> {
-                    let mut ipc_service = IPCService::new()?;
-                    ipc_service.append_text(String::new())?;
-                    Ok(ipc_service)
-                })();
-
-                // This worker never calls back into TSF while holding the state mutex, so a
-                // blocking lock is safe and prevents a transient try_lock failure from leaving
-                // reconnect_in_progress stuck forever.
-                let mut state = IME_STATE
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.ipc_reconnect_in_progress = false;
-
-                match connection_result {
-                    Ok(ipc_service) => {
-                        if state.ipc_service.is_none() {
-                            state.ipc_service = Some(ipc_service);
-                            tracing::info!("Reconnected AzooKey IPC services");
+            .spawn(move || {
+                // Connecting does not call AppendText/ClearText. Server composition belongs to
+                // the focused TIP and is reset lazily by its first stateful RPC.
+                let connection_result = IPCService::new();
+                let mut discarded_service = None;
+                {
+                    let mut state = Self::lock_blocking();
+                    if state.active_ipc_reconnect_attempt != Some(attempt_id) {
+                        discarded_service = connection_result.ok();
+                    } else {
+                        state.active_ipc_reconnect_attempt = None;
+                        match connection_result {
+                            Ok(ipc_service) if state.ipc_service.is_none() => {
+                                ipc_service.activate();
+                                state.ipc_service = Some(ipc_service);
+                                tracing::info!("Reconnected AzooKey conversion IPC");
+                            }
+                            Ok(ipc_service) => {
+                                tracing::debug!("Discard stale IPC reconnect result");
+                                discarded_service = Some(ipc_service);
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    "AzooKey IPC reconnect is not ready yet: {error:?}"
+                                );
+                            }
                         }
                     }
-                    Err(error) => {
-                        tracing::debug!("AzooKey IPC reconnect is not ready yet: {error:?}");
-                    }
                 }
+                // Dropping the last Runtime/Channel may wait for driver shutdown. Never do that
+                // while the global state mutex is held.
+                drop(discarded_service);
             });
 
         if let Err(error) = spawn_result {
-            let mut state = IME_STATE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.ipc_reconnect_in_progress = false;
+            let mut state = Self::lock_blocking();
+            if state.active_ipc_reconnect_attempt == Some(attempt_id) {
+                state.active_ipc_reconnect_attempt = None;
+            }
             return Err(error.into());
         }
 
@@ -138,17 +198,26 @@ mod tests {
     #[test]
     fn reconnect_attempts_are_throttled_and_not_duplicated() {
         let start = Instant::now();
-        assert!(reconnect_is_due(false, None, start));
-        assert!(!reconnect_is_due(true, None, start));
+        assert!(reconnect_is_due(None, None, start, false));
+        assert!(!reconnect_is_due(Some(1), None, start, false));
         assert!(!reconnect_is_due(
-            false,
+            None,
             Some(start),
-            start + IPC_RECONNECT_RETRY_INTERVAL - Duration::from_millis(1)
+            start + IPC_RECONNECT_RETRY_INTERVAL - Duration::from_millis(1),
+            false,
         ));
         assert!(reconnect_is_due(
-            false,
+            None,
             Some(start),
-            start + IPC_RECONNECT_RETRY_INTERVAL
+            start + IPC_RECONNECT_RETRY_INTERVAL,
+            false,
         ));
+    }
+
+    #[test]
+    fn failure_forces_retry_without_allowing_duplicate_worker() {
+        let start = Instant::now();
+        assert!(reconnect_is_due(None, Some(start), start, true));
+        assert!(!reconnect_is_due(Some(2), Some(start), start, true));
     }
 }
