@@ -17,7 +17,7 @@ private struct CandidatePayload {
     var correspondingCount: Int32
 }
 
-// Rust serializes every stateful FFI call with MyAzookeyService::ffi_lock.
+// Rust serializes every stateful FFI call with MyAzookeyService::ffi_state.
 // Initialize runs before the service is published, so these values do not need
 // a Swift global actor. Marking a synchronous C entry point @MainActor makes
 // Swift trap when Tokio calls it from a worker thread.

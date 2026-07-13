@@ -10,10 +10,10 @@ use shared::proto::{
     ShrinkTextResponse, Suggestion,
 };
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
 use std::fmt;
-use std::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard};
 
 const USE_ZENZAI: bool = true;
 const FFI_SUCCESS: i32 = 0;
@@ -63,7 +63,6 @@ enum FfiError {
         index: usize,
         field: &'static str,
     },
-    LockPoisoned,
 }
 
 impl fmt::Display for FfiError {
@@ -90,7 +89,6 @@ impl fmt::Display for FfiError {
                 formatter,
                 "GetComposedText returned a null {field} pointer at index {index}"
             ),
-            Self::LockPoisoned => formatter.write_str("Swift FFI lock is poisoned"),
         }
     }
 }
@@ -225,6 +223,24 @@ fn clear_text() {
     unsafe { ClearText() };
 }
 
+fn normalize_context(context: &str) -> Result<String, FfiError> {
+    let trimmed_context = context
+        .split('\r')
+        .rfind(|line| !line.is_empty())
+        .unwrap_or_default();
+    // Validate before a deferred SetContext is acknowledged. Otherwise an invalid context would
+    // fail only after the client has already moved on to AppendText.
+    make_c_string(trimmed_context, "context")?;
+    Ok(trimmed_context.to_owned())
+}
+
+fn apply_context(context: &str) -> Result<(), FfiError> {
+    let context = make_c_string(context, "context")?;
+    // SAFETY: context is NUL-terminated and valid for the duration of the call.
+    let status = unsafe { SetContext(context.as_ptr()) };
+    check_status("SetContext", status)
+}
+
 fn candidate_string(
     pointer: *mut c_char,
     index: usize,
@@ -332,25 +348,108 @@ fn convert(raw: RawComposingText) -> Result<ComposingText, FfiError> {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum IpcSessionToken {
     Legacy,
     Explicit(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingContext {
+    observed_owner_generation: u64,
+    context: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnerAccess {
+    Owned,
+    ClaimedLegacy,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetContextAccess {
+    Apply,
+    ClaimedLegacy,
+    Staged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppendAccess {
+    Owned,
+    ClaimedLegacy,
+    ClaimedExplicit { context: String },
+    Rejected,
+}
+
 #[derive(Debug, Default)]
 struct FfiSessionState {
     active_session_token: Option<IpcSessionToken>,
+    owner_generation: u64,
+    pending_contexts: HashMap<IpcSessionToken, PendingContext>,
 }
 
 impl FfiSessionState {
-    fn claim_session(&mut self, token: IpcSessionToken) -> bool {
-        if self.active_session_token.as_ref() == Some(&token) {
-            return false;
+    fn change_owner(&mut self, token: IpcSessionToken) {
+        self.active_session_token = Some(token);
+        self.owner_generation = self.owner_generation.wrapping_add(1);
+        self.pending_contexts.clear();
+    }
+
+    /// Authorizes operations that may never start a new explicit session. Legacy clients retain
+    /// their historical behavior and can claim on any stateful request.
+    fn owner_access(&mut self, token: &IpcSessionToken) -> OwnerAccess {
+        if self.active_session_token.as_ref() == Some(token) {
+            return OwnerAccess::Owned;
         }
 
-        self.active_session_token = Some(token);
-        true
+        if *token == IpcSessionToken::Legacy {
+            self.change_owner(IpcSessionToken::Legacy);
+            OwnerAccess::ClaimedLegacy
+        } else {
+            OwnerAccess::Rejected
+        }
+    }
+
+    /// SetContext is the begin marker used by current clients, but a non-owner must not disturb
+    /// the active converter yet. Its context is fenced to the observed owner generation and is
+    /// applied only if the following AppendText wins that generation.
+    fn set_context_access(&mut self, token: &IpcSessionToken, context: String) -> SetContextAccess {
+        match self.owner_access(token) {
+            OwnerAccess::Owned => SetContextAccess::Apply,
+            OwnerAccess::ClaimedLegacy => SetContextAccess::ClaimedLegacy,
+            OwnerAccess::Rejected => {
+                self.pending_contexts.insert(
+                    token.clone(),
+                    PendingContext {
+                        observed_owner_generation: self.owner_generation,
+                        context,
+                    },
+                );
+                SetContextAccess::Staged
+            }
+        }
+    }
+
+    /// AppendText is the only operation that can start a fresh explicit composition. The
+    /// generation check prevents an append staged before a newer owner from reclaiming later.
+    fn append_access(&mut self, token: &IpcSessionToken) -> AppendAccess {
+        match self.owner_access(token) {
+            OwnerAccess::Owned => AppendAccess::Owned,
+            OwnerAccess::ClaimedLegacy => AppendAccess::ClaimedLegacy,
+            OwnerAccess::Rejected => {
+                let Some(pending) = self.pending_contexts.remove(token) else {
+                    return AppendAccess::Rejected;
+                };
+                if pending.observed_owner_generation != self.owner_generation {
+                    return AppendAccess::Rejected;
+                }
+
+                AppendAccess::ClaimedExplicit {
+                    context: pending.context,
+                }
+            }
+        }
     }
 }
 
@@ -382,23 +481,15 @@ pub struct MyAzookeyService {
 }
 
 impl MyAzookeyService {
-    fn lock_ffi(&self) -> Result<MutexGuard<'_, FfiSessionState>, FfiError> {
-        self.ffi_state.lock().map_err(|_| FfiError::LockPoisoned)
+    async fn lock_ffi(&self) -> MutexGuard<'_, FfiSessionState> {
+        self.ffi_state.lock().await
     }
+}
 
-    fn lock_ffi_for_session<T>(
-        &self,
-        request: &Request<T>,
-    ) -> Result<MutexGuard<'_, FfiSessionState>, Status> {
-        // Read and validate the token before taking the process-global FFI lock. Once held, the
-        // ownership reset and the caller's target operation form one atomic critical section.
-        let token = ipc_session_token(request)?;
-        let mut state = self.lock_ffi().map_err(ffi_error_status)?;
-        if state.claim_session(token) {
-            clear_text();
-        }
-        Ok(state)
-    }
+fn non_owner_status(operation: &'static str) -> Status {
+    Status::failed_precondition(format!(
+        "conversion session does not own the converter for {operation}"
+    ))
 }
 
 #[tonic::async_trait]
@@ -407,8 +498,21 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<AppendTextRequest>,
     ) -> Result<Response<AppendTextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi_for_session(&request)?;
+        let token = ipc_session_token(&request)?;
         let input = request.into_inner().text_to_append;
+        let mut ffi_state = self.lock_ffi().await;
+        match ffi_state.append_access(&token) {
+            AppendAccess::Owned => {}
+            AppendAccess::ClaimedLegacy => clear_text(),
+            AppendAccess::ClaimedExplicit { context } => {
+                clear_text();
+                apply_context(&context).map_err(ffi_error_status)?;
+                // Commit logical ownership only after the deferred context has successfully
+                // reached Swift. A SetContext failure leaves the previous owner authoritative.
+                ffi_state.change_owner(token.clone());
+            }
+            AppendAccess::Rejected => return Err(non_owner_status("AppendText")),
+        }
         let composing_text = add_text(&input)
             .and_then(convert)
             .map_err(ffi_error_status)?;
@@ -422,7 +526,13 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi_for_session(&request)?;
+        let token = ipc_session_token(&request)?;
+        let mut ffi_state = self.lock_ffi().await;
+        match ffi_state.owner_access(&token) {
+            OwnerAccess::Owned => {}
+            OwnerAccess::ClaimedLegacy => clear_text(),
+            OwnerAccess::Rejected => return Err(non_owner_status("RemoveText")),
+        }
         let composing_text = remove_text().and_then(convert).map_err(ffi_error_status)?;
 
         Ok(Response::new(RemoveTextResponse {
@@ -434,8 +544,15 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
-        let _ffi_guard = self.lock_ffi_for_session(&request)?;
-        let composing_text = move_cursor(request.into_inner().offset)
+        let token = ipc_session_token(&request)?;
+        let offset = request.into_inner().offset;
+        let mut ffi_state = self.lock_ffi().await;
+        match ffi_state.owner_access(&token) {
+            OwnerAccess::Owned => {}
+            OwnerAccess::ClaimedLegacy => clear_text(),
+            OwnerAccess::Rejected => return Err(non_owner_status("MoveCursor")),
+        }
+        let composing_text = move_cursor(offset)
             .and_then(convert)
             .map_err(ffi_error_status)?;
 
@@ -448,8 +565,13 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ClearTextRequest>,
     ) -> Result<Response<ClearTextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi_for_session(&request)?;
-        clear_text();
+        let token = ipc_session_token(&request)?;
+        let mut ffi_state = self.lock_ffi().await;
+        match ffi_state.owner_access(&token) {
+            OwnerAccess::Owned | OwnerAccess::ClaimedLegacy => clear_text(),
+            // A late termination from an old explicit session must not clear the current owner.
+            OwnerAccess::Rejected => {}
+        }
         Ok(Response::new(ClearTextResponse {}))
     }
 
@@ -457,8 +579,15 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi_for_session(&request)?;
-        let composing_text = shrink_text(request.into_inner().offset)
+        let token = ipc_session_token(&request)?;
+        let offset = request.into_inner().offset;
+        let mut ffi_state = self.lock_ffi().await;
+        match ffi_state.owner_access(&token) {
+            OwnerAccess::Owned => {}
+            OwnerAccess::ClaimedLegacy => clear_text(),
+            OwnerAccess::Rejected => return Err(non_owner_status("ShrinkText")),
+        }
+        let composing_text = shrink_text(offset)
             .and_then(convert)
             .map_err(ffi_error_status)?;
 
@@ -471,9 +600,15 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<CommitPrefixAndAppendRequest>,
     ) -> Result<Response<CommitPrefixAndAppendResponse>, Status> {
-        let _ffi_guard = self.lock_ffi_for_session(&request)?;
-        let request = request.into_inner();
-        let composing_text = commit_prefix_and_append(request.offset, &request.text_to_append)
+        let token = ipc_session_token(&request)?;
+        let message = request.into_inner();
+        let mut ffi_state = self.lock_ffi().await;
+        match ffi_state.owner_access(&token) {
+            OwnerAccess::Owned => {}
+            OwnerAccess::ClaimedLegacy => clear_text(),
+            OwnerAccess::Rejected => return Err(non_owner_status("CommitPrefixAndAppend")),
+        }
+        let composing_text = commit_prefix_and_append(message.offset, &message.text_to_append)
             .and_then(convert)
             .map_err(ffi_error_status)?;
 
@@ -486,17 +621,17 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::SetContextRequest>,
     ) -> Result<Response<shared::proto::SetContextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi_for_session(&request)?;
-        let context = request.into_inner().context;
-        let trimmed_context = context
-            .split('\r')
-            .rfind(|line| !line.is_empty())
-            .unwrap_or_default();
-        let context = make_c_string(trimmed_context, "context").map_err(ffi_error_status)?;
-
-        // SAFETY: context is NUL-terminated and valid for the duration of the call.
-        let status = unsafe { SetContext(context.as_ptr()) };
-        check_status("SetContext", status).map_err(ffi_error_status)?;
+        let token = ipc_session_token(&request)?;
+        let context = normalize_context(&request.into_inner().context).map_err(ffi_error_status)?;
+        let mut ffi_state = self.lock_ffi().await;
+        match ffi_state.set_context_access(&token, context.clone()) {
+            SetContextAccess::Apply => apply_context(&context).map_err(ffi_error_status)?,
+            SetContextAccess::ClaimedLegacy => {
+                clear_text();
+                apply_context(&context).map_err(ffi_error_status)?;
+            }
+            SetContextAccess::Staged => {}
+        }
         Ok(Response::new(shared::proto::SetContextResponse {}))
     }
 
@@ -504,7 +639,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         _: Request<shared::proto::UpdateConfigRequest>,
     ) -> Result<Response<shared::proto::UpdateConfigResponse>, Status> {
-        let _ffi_guard = self.lock_ffi().map_err(ffi_error_status)?;
+        let _ffi_guard = self.lock_ffi().await;
         // SAFETY: LoadConfig takes no pointers and returns a fixed-width status code.
         let status = unsafe { LoadConfig() };
         check_status("LoadConfig", status).map_err(ffi_error_status)?;
@@ -618,16 +753,172 @@ mod tests {
         );
     }
 
-    #[test]
-    fn converter_session_resets_only_when_the_owner_changes() {
-        let mut state = FfiSessionState::default();
+    fn explicit_token(name: &str) -> IpcSessionToken {
+        IpcSessionToken::Explicit(name.to_owned())
+    }
 
-        assert!(state.claim_session(IpcSessionToken::Legacy));
-        assert!(!state.claim_session(IpcSessionToken::Legacy));
-        assert!(state.claim_session(IpcSessionToken::Explicit("tip-1".to_owned())));
-        assert!(!state.claim_session(IpcSessionToken::Explicit("tip-1".to_owned())));
-        assert!(state.claim_session(IpcSessionToken::Explicit("tip-2".to_owned())));
-        assert!(state.claim_session(IpcSessionToken::Legacy));
+    #[test]
+    fn non_owner_context_is_staged_without_changing_the_owner() {
+        let mut state = FfiSessionState::default();
+        let token = explicit_token("tip-a");
+
+        assert_eq!(
+            state.set_context_access(&token, "context-a".to_owned()),
+            SetContextAccess::Staged
+        );
+        assert_eq!(state.active_session_token, None);
+        assert_eq!(state.owner_generation, 0);
+        assert_eq!(
+            state.pending_contexts.get(&token),
+            Some(&PendingContext {
+                observed_owner_generation: 0,
+                context: "context-a".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn staged_append_claims_and_carries_context_atomically() {
+        let mut state = FfiSessionState::default();
+        let token = explicit_token("tip-a");
+        state.set_context_access(&token, "context-a".to_owned());
+
+        assert_eq!(
+            state.append_access(&token),
+            AppendAccess::ClaimedExplicit {
+                context: "context-a".to_owned(),
+            }
+        );
+        assert_eq!(state.active_session_token, None);
+        assert_eq!(state.owner_generation, 0);
+        // The handler commits this only after apply_context succeeds.
+        state.change_owner(token.clone());
+        assert_eq!(state.active_session_token, Some(token));
+        assert_eq!(state.owner_generation, 1);
+        assert!(state.pending_contexts.is_empty());
+    }
+
+    #[test]
+    fn newer_claim_fences_an_append_staged_for_the_previous_generation() {
+        let mut state = FfiSessionState::default();
+        let old = explicit_token("tip-a");
+        let new = explicit_token("tip-b");
+        state.set_context_access(&old, "context-a".to_owned());
+        state.set_context_access(&new, "context-b".to_owned());
+
+        assert!(matches!(
+            state.append_access(&new),
+            AppendAccess::ClaimedExplicit { .. }
+        ));
+        state.change_owner(new.clone());
+        assert_eq!(state.append_access(&old), AppendAccess::Rejected);
+        assert_eq!(state.active_session_token, Some(new));
+        assert_eq!(state.owner_generation, 1);
+    }
+
+    #[test]
+    fn delayed_context_after_a_claim_does_not_replace_or_clear_the_owner() {
+        let mut state = FfiSessionState::default();
+        let old = explicit_token("tip-a");
+        let current = explicit_token("tip-b");
+        state.set_context_access(&current, "context-b".to_owned());
+        state.append_access(&current);
+        state.change_owner(current.clone());
+
+        assert_eq!(
+            state.set_context_access(&old, "late-a".to_owned()),
+            SetContextAccess::Staged
+        );
+        assert_eq!(state.active_session_token, Some(current));
+        assert_eq!(state.owner_generation, 1);
+    }
+
+    #[test]
+    fn non_owner_clear_is_a_noop_and_other_mutations_are_rejected() {
+        let mut state = FfiSessionState::default();
+        let owner = explicit_token("tip-a");
+        let stale = explicit_token("tip-b");
+        state.set_context_access(&owner, "context-a".to_owned());
+        state.append_access(&owner);
+        state.change_owner(owner.clone());
+        let generation = state.owner_generation;
+
+        // ClearText maps Rejected to a successful no-op; other mutation handlers map it to
+        // failed_precondition. In both cases authorization leaves ownership untouched.
+        assert_eq!(state.owner_access(&stale), OwnerAccess::Rejected);
+        assert_eq!(state.owner_access(&stale), OwnerAccess::Rejected);
+        assert_eq!(state.active_session_token, Some(owner));
+        assert_eq!(state.owner_generation, generation);
+    }
+
+    #[test]
+    fn owner_clear_does_not_advance_the_ownership_generation() {
+        let mut state = FfiSessionState::default();
+        let owner = explicit_token("tip-a");
+        state.set_context_access(&owner, "context-a".to_owned());
+        state.append_access(&owner);
+        state.change_owner(owner.clone());
+        let generation = state.owner_generation;
+
+        assert_eq!(state.owner_access(&owner), OwnerAccess::Owned);
+        assert_eq!(state.owner_generation, generation);
+    }
+
+    #[test]
+    fn active_owner_context_applies_without_resetting_ownership() {
+        let mut state = FfiSessionState::default();
+        let owner = explicit_token("tip-a");
+        state.set_context_access(&owner, "first".to_owned());
+        state.append_access(&owner);
+        state.change_owner(owner.clone());
+        let generation = state.owner_generation;
+
+        assert_eq!(
+            state.set_context_access(&owner, "updated".to_owned()),
+            SetContextAccess::Apply
+        );
+        assert_eq!(state.owner_generation, generation);
+    }
+
+    #[test]
+    fn restarted_server_requires_context_before_the_first_explicit_append() {
+        let mut state = FfiSessionState::default();
+        let token = explicit_token("tip-a");
+
+        assert_eq!(state.append_access(&token), AppendAccess::Rejected);
+        assert_eq!(
+            state.set_context_access(&token, "context-a".to_owned()),
+            SetContextAccess::Staged
+        );
+        assert!(matches!(
+            state.append_access(&token),
+            AppendAccess::ClaimedExplicit { .. }
+        ));
+        state.change_owner(token.clone());
+        assert_eq!(state.active_session_token, Some(token));
+    }
+
+    #[test]
+    fn legacy_requests_keep_claim_on_any_stateful_operation_behavior() {
+        let mut state = FfiSessionState::default();
+        assert_eq!(
+            state.owner_access(&IpcSessionToken::Legacy),
+            OwnerAccess::ClaimedLegacy
+        );
+        assert_eq!(
+            state.owner_access(&IpcSessionToken::Legacy),
+            OwnerAccess::Owned
+        );
+
+        let explicit = explicit_token("tip-a");
+        state.set_context_access(&explicit, "context-a".to_owned());
+        state.append_access(&explicit);
+        state.change_owner(explicit);
+        assert_eq!(
+            state.owner_access(&IpcSessionToken::Legacy),
+            OwnerAccess::ClaimedLegacy
+        );
+        assert_eq!(state.active_session_token, Some(IpcSessionToken::Legacy));
     }
 
     #[test]
