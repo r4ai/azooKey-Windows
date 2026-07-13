@@ -106,6 +106,8 @@ try {
         (Join-Path $stagingDir "Dictionary") -Recurse
     Copy-RequiredItem (Join-Path $workspaceRoot "zenz.gguf") $stagingDir
 
+    & (Join-Path $PSScriptRoot "test-server-smoke.ps1") -BuildDirectory $stagingDir
+
     & "$env:WINDIR\System32\icacls.exe" `
         (Join-Path $stagingDir "azookey_windows.dll") /grant "*S-1-15-2-1:(RX)"
     if ($LASTEXITCODE -ne 0) {

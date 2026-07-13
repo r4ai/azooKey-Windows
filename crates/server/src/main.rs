@@ -17,6 +17,33 @@ use std::sync::{Mutex, MutexGuard};
 
 const USE_ZENZAI: bool = true;
 const FFI_SUCCESS: i32 = 0;
+const DEFAULT_SERVER_PIPE_NAME: &str = "azookey_server";
+const SMOKE_TEST_PIPE_NAME_ENV: &str = "AZOOKEY_SERVER_SMOKE_TEST_PIPE_NAME";
+const SMOKE_TEST_PIPE_NAME_PREFIX: &str = "azookey_server_smoke_";
+
+fn is_valid_smoke_test_pipe_name(name: &str) -> bool {
+    let Some(identifier) = name.strip_prefix(SMOKE_TEST_PIPE_NAME_PREFIX) else {
+        return false;
+    };
+    identifier.len() == 32 && identifier.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn server_pipe_name() -> std::io::Result<String> {
+    match std::env::var(SMOKE_TEST_PIPE_NAME_ENV) {
+        Ok(name) if is_valid_smoke_test_pipe_name(&name) => Ok(name),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{SMOKE_TEST_PIPE_NAME_ENV} must be '{SMOKE_TEST_PIPE_NAME_PREFIX}' followed by 32 hexadecimal characters"
+            ),
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_SERVER_PIPE_NAME.to_owned()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{SMOKE_TEST_PIPE_NAME_ENV} is not valid Unicode"),
+        )),
+    }
+}
 
 struct RawComposingText {
     text: String,
@@ -446,6 +473,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     initialize(parent_dir)?;
 
     let service = MyAzookeyService::default();
+    // The override is deliberately restricted to GUID-suffixed smoke-test names so an
+    // installed AzooKey can keep using the production pipe while a staged build is verified.
+    let pipe_name = server_pipe_name()?;
 
     println!("AzookeyServer listening");
 
@@ -457,7 +487,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build_v1()
                 .unwrap(),
         )
-        .serve_with_incoming(TonicNamedPipeServer::new("azookey_server"))
+        .serve_with_incoming(TonicNamedPipeServer::new(&pipe_name))
         .await?;
 
     Ok(())
@@ -518,6 +548,17 @@ mod tests {
         };
         assert!(composing_text.suggestions.is_empty());
         assert_eq!(composing_text.raw_input, "kyo");
+    }
+
+    #[test]
+    fn smoke_test_pipe_name_requires_a_guid_suffix() {
+        assert!(is_valid_smoke_test_pipe_name(
+            "azookey_server_smoke_0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_valid_smoke_test_pipe_name("azookey_server"));
+        assert!(!is_valid_smoke_test_pipe_name(
+            "azookey_server_smoke_not-a-guid"
+        ));
     }
 
     #[test]
