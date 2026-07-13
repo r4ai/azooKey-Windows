@@ -519,4 +519,16 @@ mod tests {
         assert!(composing_text.suggestions.is_empty());
         assert_eq!(composing_text.raw_input, "kyo");
     }
+
+    #[test]
+    fn swift_ffi_accepts_non_main_thread_calls() {
+        let status = std::thread::spawn(|| {
+            // SAFETY: LoadConfig takes no pointers and only reloads process-local state.
+            unsafe { LoadConfig() }
+        })
+        .join()
+        .expect("Swift FFI must not trap when called by a worker thread");
+
+        assert_eq!(status, FFI_SUCCESS);
+    }
 }

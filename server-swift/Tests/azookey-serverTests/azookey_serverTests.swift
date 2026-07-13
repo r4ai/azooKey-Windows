@@ -2,7 +2,6 @@ import Testing
 @testable import azookey_server
 
 @Test
-@MainActor
 func ffiRejectsNullRequiredArguments() {
     #expect(initialize(path: nil, useZenzai: 1) == 1)
     #expect(setContext(context: nil) == 1)

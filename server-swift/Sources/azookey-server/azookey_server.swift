@@ -17,16 +17,19 @@ private struct CandidatePayload {
     var correspondingCount: Int32
 }
 
-@MainActor private var converter: KanaKanjiConverter?
-@MainActor private var composingText = ComposingText()
-@MainActor private var executableURL: URL?
-@MainActor private var configuration = ServerConfiguration()
-@MainActor private var zenzaiAllowed = true
-@MainActor private var cachedTextReplacer: TextReplacer?
-@MainActor private var cachedOptions: ConvertRequestOptions?
-@MainActor private var cachedOptionsConfiguration: ServerConfiguration?
+// Rust serializes every stateful FFI call with MyAzookeyService::ffi_lock.
+// Initialize runs before the service is published, so these values do not need
+// a Swift global actor. Marking a synchronous C entry point @MainActor makes
+// Swift trap when Tokio calls it from a worker thread.
+nonisolated(unsafe) private var converter: KanaKanjiConverter?
+nonisolated(unsafe) private var composingText = ComposingText()
+nonisolated(unsafe) private var executableURL: URL?
+nonisolated(unsafe) private var configuration = ServerConfiguration()
+nonisolated(unsafe) private var zenzaiAllowed = true
+nonisolated(unsafe) private var cachedTextReplacer: TextReplacer?
+nonisolated(unsafe) private var cachedOptions: ConvertRequestOptions?
+nonisolated(unsafe) private var cachedOptionsConfiguration: ServerConfiguration?
 
-@MainActor
 private func requestOptions() -> ConvertRequestOptions? {
     guard let executableURL else {
         return nil
@@ -70,7 +73,6 @@ private func requestOptions() -> ConvertRequestOptions? {
     return options
 }
 
-@MainActor
 private func reloadConfiguration() {
     var updated = ServerConfiguration()
     updated.context = configuration.context
@@ -151,7 +153,6 @@ func rawInputString(from pieces: [InputPiece]) -> String {
     )
 }
 
-@MainActor
 private func candidatePayloads() -> [CandidatePayload]? {
     guard let converter, let options = requestOptions() else {
         return nil
@@ -244,7 +245,6 @@ private func allocateCandidateList(
     return list
 }
 
-@MainActor
 private func copyCurrentComposingText(
     cursorPointer: UnsafeMutablePointer<Int32>
 ) -> UnsafeMutablePointer<CChar>? {
@@ -256,14 +256,12 @@ private func copyCurrentComposingText(
 }
 
 @_cdecl("LoadConfig")
-@MainActor
 public func loadConfig() -> Int32 {
     reloadConfiguration()
     return ffiSuccess
 }
 
 @_cdecl("Initialize")
-@MainActor
 public func initialize(
     path: UnsafePointer<CChar>?,
     useZenzai: Int32
@@ -308,7 +306,6 @@ public func initialize(
 }
 
 @_cdecl("AppendText")
-@MainActor
 public func appendText(
     input: UnsafePointer<CChar>?,
     cursorPointer: UnsafeMutablePointer<Int32>?
@@ -321,7 +318,6 @@ public func appendText(
 }
 
 @_cdecl("RemoveText")
-@MainActor
 public func removeText(
     cursorPointer: UnsafeMutablePointer<Int32>?
 ) -> UnsafeMutablePointer<CChar>? {
@@ -333,7 +329,6 @@ public func removeText(
 }
 
 @_cdecl("MoveCursor")
-@MainActor
 public func moveCursor(
     offset: Int32,
     cursorPointer: UnsafeMutablePointer<Int32>?
@@ -346,7 +341,6 @@ public func moveCursor(
 }
 
 @_cdecl("ShrinkText")
-@MainActor
 public func shrinkText(offset: Int32) -> UnsafeMutablePointer<CChar>? {
     guard converter != nil,
           offset >= 0,
@@ -358,7 +352,6 @@ public func shrinkText(offset: Int32) -> UnsafeMutablePointer<CChar>? {
 }
 
 @_cdecl("CommitPrefixAndAppend")
-@MainActor
 public func commitPrefixAndAppend(
     offset: Int32,
     input: UnsafePointer<CChar>?,
@@ -378,7 +371,6 @@ public func commitPrefixAndAppend(
 }
 
 @_cdecl("ClearText")
-@MainActor
 public func clearText() {
     composingText.stopComposition()
     converter?.stopComposition()
@@ -390,7 +382,6 @@ public func clearText() {
 }
 
 @_cdecl("GetComposedText")
-@MainActor
 public func getComposedText(
     lengthPointer: UnsafeMutablePointer<Int32>?
 ) -> UnsafeMutablePointer<UnsafeMutablePointer<FFICandidate>?>? {
@@ -416,7 +407,6 @@ public func getComposedText(
 }
 
 @_cdecl("GetRawInput")
-@MainActor
 public func getRawInput() -> UnsafeMutablePointer<CChar>? {
     guard converter != nil else {
         return nil
@@ -441,7 +431,6 @@ public func freeCandidateList(
 }
 
 @_cdecl("SetContext")
-@MainActor
 public func setContext(context: UnsafePointer<CChar>?) -> Int32 {
     guard let context else {
         return ffiInvalidArgument
