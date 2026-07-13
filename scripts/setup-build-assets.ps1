@@ -2,6 +2,7 @@
 param([switch]$Force)
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "build-utils.ps1")
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $llamaVersion = "b4846"
@@ -27,7 +28,7 @@ function Test-FileHash {
         return $false
     }
 
-    $actualSha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    $actualSha256 = Get-AzooKeyFileSha256 -Path $Path
     return $actualSha256 -eq $ExpectedSha256
 }
 
@@ -88,9 +89,8 @@ function Write-LlamaManifest {
 
     $fileHashes = [ordered]@{}
     foreach ($expectedFile in $ExpectedFiles) {
-        $fileHashes[$expectedFile] = (Get-FileHash `
-            -LiteralPath (Join-Path $DestinationPath $expectedFile) `
-            -Algorithm SHA256).Hash
+        $fileHashes[$expectedFile] = Get-AzooKeyFileSha256 `
+            -Path (Join-Path $DestinationPath $expectedFile)
     }
     $manifest = [ordered]@{
         archiveSha256 = $ArchiveSha256
@@ -131,7 +131,7 @@ function Install-LlamaArchive {
         }
 
         New-Item -Path $stagingPath -ItemType Directory | Out-Null
-        Expand-Archive -LiteralPath $temporaryZip -DestinationPath $stagingPath
+        Expand-AzooKeyZipArchive -ArchivePath $temporaryZip -DestinationPath $stagingPath
         foreach ($expectedFile in $ExpectedFiles) {
             if (-not (Test-UsableFile (Join-Path $stagingPath $expectedFile))) {
                 throw "$expectedFile was not found after extracting $ArchiveName."

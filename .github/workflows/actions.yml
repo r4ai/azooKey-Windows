@@ -36,23 +36,8 @@ jobs:
         version: "29.6"
         repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Install Rust x86 target
-      run: rustup target add i686-pc-windows-msvc
-
     - name: Install cargo-make
       run: cargo install cargo-make --version 0.37.24 --locked
-
-    - name: Download inference build assets
-      shell: pwsh
-      run: .\scripts\setup-build-assets.ps1
-
-    - name: Resolve and patch Zenzai inference dependency
-      shell: pwsh
-      run: |
-        Push-Location server-swift
-        swift package resolve
-        Pop-Location
-        & .\scripts\patch-kkc.ps1 -PackagePath .\server-swift
 
     - name: Set up Node.js
       uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -60,11 +45,6 @@ jobs:
         node-version: "24.18.0"
         cache: npm
         cache-dependency-path: frontend/package-lock.json
-
-    - name: Install node dependencies
-      run: |
-        cd frontend
-        npm ci
 
     - name: Build
       run: cargo make build --release

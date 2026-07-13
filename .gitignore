@@ -1,5 +1,6 @@
 target
 build
+.build-tools
 llama_cpu
 llama_cuda
 llama_vulkan

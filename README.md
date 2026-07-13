@@ -48,11 +48,9 @@
 - [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（「C++によるデスクトップ開発」とWindows SDK）
 - [Rust](https://www.rust-lang.org/tools/install)（MSVC toolchain）
 - [Swift for Windows](https://www.swift.org/install/windows/)（Swift 6.1以上）
-- [protoc 29.6](https://protobuf.dev/installation/)
-- [Node.js 24.18.0](https://nodejs.org/en/download/)
-- [Inno Setup 6](https://jrsoftware.org/isinfo.php)（`ISCC.exe`を`PATH`に追加）
+- [cargo-make](https://github.com/sagiegurari/cargo-make)
 
-SwiftとRustからMSVCのヘッダー・ライブラリを参照できるよう、以下のコマンドは「Developer PowerShell for VS 2022」または「x64 Native Tools Command Prompt for VS 2022」から起動したPowerShellで実行してください。
+Swiftは標準のインストール先から自動検出し、MSVC環境もVisual Studioから自動で読み込みます。Node.js 24.18.0、protoc 29.6、Inno Setup 6.7.3は、初回ビルド時にSHA-256などを検証して`.build-tools`へportable配置します。
 
 AzooKeyのUIAccess起動には管理者権限が必要です。インストールと実行は管理者アカウントで行ってください。標準ユーザーから別の管理者資格情報を入力してインストールする構成は、現在サポートしていません。
 
@@ -67,15 +65,10 @@ git clone https://github.com/fkunn1326/azookey-Windows --recursive
 #### 初回セットアップ
 
 ```powershell
-rustup target add i686-pc-windows-msvc
 cargo install cargo-make --version 0.37.24 --locked
-Push-Location frontend
-npm ci
-Pop-Location
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-build-assets.ps1
 ```
 
-最後のスクリプトは、ビルドに必要なllama.cpp b4846のCPU/CUDA/VulkanバイナリとZenzモデルをダウンロードし、Swiftのリンク用ライブラリも配置します。再取得する場合は`-Force`を付けてください。
+Rustのi686 target、llama.cpp b4846のCPU/CUDA/Vulkanバイナリ、Zenzモデル、npm依存もビルドフロー内で検証・準備されるため、2回目以降は次のコマンドだけでビルドできます。初回のみ各資材のダウンロードが発生します。
 
 #### リリースビルド
 
