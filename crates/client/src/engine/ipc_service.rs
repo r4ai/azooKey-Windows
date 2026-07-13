@@ -474,6 +474,9 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn request_with_session_token<T>(message: T, session_token: &str) -> Result<tonic::Request<T>> {
     let mut request = tonic::Request::new(message);
+    // Endpoint::timeout bounds the client future, while grpc-timeout also lets the server
+    // cancel a request that is still waiting for the process-global converter lock.
+    request.set_timeout(CONVERSION_RPC_TIMEOUT);
     request.metadata_mut().insert(
         shared::IPC_SESSION_METADATA_KEY,
         session_token
@@ -998,6 +1001,7 @@ mod tests {
                 .unwrap(),
             "0123456789abcdef"
         );
+        assert!(request.metadata().contains_key("grpc-timeout"));
     }
 
     #[test]
