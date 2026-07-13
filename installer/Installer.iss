@@ -40,17 +40,20 @@ OutputBaseFilename=azookey-setup
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
+CloseApplications=no
+AlwaysRestart=yes
 
 [Languages]
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 
 [Files]
-Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver 64bit
-Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver 32bit
+Source: "../build/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey.dll"; Flags: ignoreversion regserver restartreplace 64bit
+Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey32.dll"; Flags: ignoreversion regserver restartreplace 32bit
 Source: "../build/*"; DestDir: "{app}"; Excludes: "azookey-setup.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "../target/{#BuildProfile}/bundle/nsis/Azookey_0.1.0_x64-setup.exe"; Flags: dontcopy noencryption
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
 Source: "./SetupStartupTask.ps1"; Flags: dontcopy noencryption
+Source: "./StopAzookeyRuntime.ps1"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [UninstallDelete]
@@ -128,6 +131,53 @@ begin
       for I := 0 to Length(Output.StdOut) - 1 do
         ErrorMessage := ErrorMessage + #13#10 + Output.StdOut[I];
     RaiseException(ErrorMessage);
+  end;
+end;
+
+procedure StopExistingRuntime();
+var
+  StopScriptPath: string;
+  Params: string;
+  ResultCode: Integer;
+  Output: TExecOutput;
+  ErrorMessage: string;
+  I: Integer;
+begin
+  ExtractTemporaryFile('StopAzookeyRuntime.ps1');
+  StopScriptPath := ExpandConstant('{tmp}\StopAzookeyRuntime.ps1');
+  Params :=
+    '-NoProfile -ExecutionPolicy Bypass -File "' + StopScriptPath + '"' +
+    ' -InstallDirectory "' + ExpandConstant('{app}') + '"' +
+    ' -TaskName "Azookey Startup"';
+
+  if not ExecAndCaptureOutput(
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Params, '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode, Output) then
+  begin
+    RaiseException('Failed to start the AzooKey runtime shutdown helper.');
+  end;
+  if ResultCode <> 0 then
+  begin
+    ErrorMessage := Format(
+      'AzooKey runtime shutdown failed with exit code %d.', [ResultCode]);
+    if Length(Output.StdErr) > 0 then
+      for I := 0 to Length(Output.StdErr) - 1 do
+        ErrorMessage := ErrorMessage + #13#10 + Output.StdErr[I];
+    if Length(Output.StdOut) > 0 then
+      for I := 0 to Length(Output.StdOut) - 1 do
+        ErrorMessage := ErrorMessage + #13#10 + Output.StdOut[I];
+    RaiseException(ErrorMessage);
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  try
+    StopExistingRuntime();
+  except
+    Result := GetExceptionMessage();
   end;
 end;
 
