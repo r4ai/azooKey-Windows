@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// gRPC metadata key that identifies the client session owning the process-global converter.
+///
+/// Metadata keys must remain lowercase ASCII. Stateful conversion RPCs require a non-empty value
+/// for this key so the server can reset Swift's process-global composing state on an ownership
+/// change. Older clients may omit the key; the server groups those requests into one fixed
+/// legacy session for compatibility.
+pub const IPC_SESSION_METADATA_KEY: &str = "x-azookey-session-token";
+
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/azookey.rs"));
     include!(concat!(env!("OUT_DIR"), "/window.rs"));

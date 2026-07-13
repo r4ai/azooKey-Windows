@@ -332,14 +332,72 @@ fn convert(raw: RawComposingText) -> Result<ComposingText, FfiError> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IpcSessionToken {
+    Legacy,
+    Explicit(String),
+}
+
+#[derive(Debug, Default)]
+struct FfiSessionState {
+    active_session_token: Option<IpcSessionToken>,
+}
+
+impl FfiSessionState {
+    fn claim_session(&mut self, token: IpcSessionToken) -> bool {
+        if self.active_session_token.as_ref() == Some(&token) {
+            return false;
+        }
+
+        self.active_session_token = Some(token);
+        true
+    }
+}
+
+fn ipc_session_token<T>(request: &Request<T>) -> Result<IpcSessionToken, Status> {
+    let Some(token) = request.metadata().get(shared::IPC_SESSION_METADATA_KEY) else {
+        // Released DLLs predate per-session metadata. Treat all of their requests as one fixed
+        // owner so they keep working while still participating in ownership transitions.
+        return Ok(IpcSessionToken::Legacy);
+    };
+    let token = token.to_str().map_err(|_| {
+        Status::invalid_argument(format!(
+            "gRPC metadata '{}' must be ASCII",
+            shared::IPC_SESSION_METADATA_KEY
+        ))
+    })?;
+    if token.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "gRPC metadata '{}' must not be empty",
+            shared::IPC_SESSION_METADATA_KEY
+        )));
+    }
+
+    Ok(IpcSessionToken::Explicit(token.to_owned()))
+}
+
 #[derive(Debug, Default)]
 pub struct MyAzookeyService {
-    ffi_lock: Mutex<()>,
+    ffi_state: Mutex<FfiSessionState>,
 }
 
 impl MyAzookeyService {
-    fn lock_ffi(&self) -> Result<MutexGuard<'_, ()>, FfiError> {
-        self.ffi_lock.lock().map_err(|_| FfiError::LockPoisoned)
+    fn lock_ffi(&self) -> Result<MutexGuard<'_, FfiSessionState>, FfiError> {
+        self.ffi_state.lock().map_err(|_| FfiError::LockPoisoned)
+    }
+
+    fn lock_ffi_for_session<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<MutexGuard<'_, FfiSessionState>, Status> {
+        // Read and validate the token before taking the process-global FFI lock. Once held, the
+        // ownership reset and the caller's target operation form one atomic critical section.
+        let token = ipc_session_token(request)?;
+        let mut state = self.lock_ffi().map_err(ffi_error_status)?;
+        if state.claim_session(token) {
+            clear_text();
+        }
+        Ok(state)
     }
 }
 
@@ -349,7 +407,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<AppendTextRequest>,
     ) -> Result<Response<AppendTextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi().map_err(ffi_error_status)?;
+        let _ffi_guard = self.lock_ffi_for_session(&request)?;
         let input = request.into_inner().text_to_append;
         let composing_text = add_text(&input)
             .and_then(convert)
@@ -362,9 +420,9 @@ impl AzookeyService for MyAzookeyService {
 
     async fn remove_text(
         &self,
-        _: Request<RemoveTextRequest>,
+        request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi().map_err(ffi_error_status)?;
+        let _ffi_guard = self.lock_ffi_for_session(&request)?;
         let composing_text = remove_text().and_then(convert).map_err(ffi_error_status)?;
 
         Ok(Response::new(RemoveTextResponse {
@@ -376,7 +434,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<MoveCursorRequest>,
     ) -> Result<Response<MoveCursorResponse>, Status> {
-        let _ffi_guard = self.lock_ffi().map_err(ffi_error_status)?;
+        let _ffi_guard = self.lock_ffi_for_session(&request)?;
         let composing_text = move_cursor(request.into_inner().offset)
             .and_then(convert)
             .map_err(ffi_error_status)?;
@@ -388,9 +446,9 @@ impl AzookeyService for MyAzookeyService {
 
     async fn clear_text(
         &self,
-        _: Request<ClearTextRequest>,
+        request: Request<ClearTextRequest>,
     ) -> Result<Response<ClearTextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi().map_err(ffi_error_status)?;
+        let _ffi_guard = self.lock_ffi_for_session(&request)?;
         clear_text();
         Ok(Response::new(ClearTextResponse {}))
     }
@@ -399,7 +457,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<ShrinkTextRequest>,
     ) -> Result<Response<ShrinkTextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi().map_err(ffi_error_status)?;
+        let _ffi_guard = self.lock_ffi_for_session(&request)?;
         let composing_text = shrink_text(request.into_inner().offset)
             .and_then(convert)
             .map_err(ffi_error_status)?;
@@ -413,7 +471,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<CommitPrefixAndAppendRequest>,
     ) -> Result<Response<CommitPrefixAndAppendResponse>, Status> {
-        let _ffi_guard = self.lock_ffi().map_err(ffi_error_status)?;
+        let _ffi_guard = self.lock_ffi_for_session(&request)?;
         let request = request.into_inner();
         let composing_text = commit_prefix_and_append(request.offset, &request.text_to_append)
             .and_then(convert)
@@ -428,7 +486,7 @@ impl AzookeyService for MyAzookeyService {
         &self,
         request: Request<shared::proto::SetContextRequest>,
     ) -> Result<Response<shared::proto::SetContextResponse>, Status> {
-        let _ffi_guard = self.lock_ffi().map_err(ffi_error_status)?;
+        let _ffi_guard = self.lock_ffi_for_session(&request)?;
         let context = request.into_inner().context;
         let trimmed_context = context
             .split('\r')
@@ -548,6 +606,28 @@ mod tests {
         };
         assert!(composing_text.suggestions.is_empty());
         assert_eq!(composing_text.raw_input, "kyo");
+    }
+
+    #[test]
+    fn missing_session_metadata_uses_the_fixed_legacy_owner() {
+        let request = Request::new(());
+
+        assert_eq!(
+            ipc_session_token(&request).unwrap(),
+            IpcSessionToken::Legacy
+        );
+    }
+
+    #[test]
+    fn converter_session_resets_only_when_the_owner_changes() {
+        let mut state = FfiSessionState::default();
+
+        assert!(state.claim_session(IpcSessionToken::Legacy));
+        assert!(!state.claim_session(IpcSessionToken::Legacy));
+        assert!(state.claim_session(IpcSessionToken::Explicit("tip-1".to_owned())));
+        assert!(!state.claim_session(IpcSessionToken::Explicit("tip-1".to_owned())));
+        assert!(state.claim_session(IpcSessionToken::Explicit("tip-2".to_owned())));
+        assert!(state.claim_session(IpcSessionToken::Legacy));
     }
 
     #[test]
