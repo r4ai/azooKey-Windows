@@ -45,11 +45,16 @@
 
 ### 開発環境のセットアップ
 
-- [Rust](https://www.rust-lang.org/tools/install)
-- [Swift for Windows](https://www.swift.org/install/windows/) (Swift 6.0以上)
-- [protoc](https://protobuf.dev/installation/) 
-- [node.js](https://nodejs.org/en/download/)
-- [inno setup](https://jrsoftware.org/isinfo.php)
+- [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（「C++によるデスクトップ開発」とWindows SDK）
+- [Rust](https://www.rust-lang.org/tools/install)（MSVC toolchain）
+- [Swift for Windows](https://www.swift.org/install/windows/)（Swift 6.1以上）
+- [protoc 29.6](https://protobuf.dev/installation/)
+- [Node.js 24.18.0](https://nodejs.org/en/download/)
+- [Inno Setup 6](https://jrsoftware.org/isinfo.php)（`ISCC.exe`を`PATH`に追加）
+
+SwiftとRustからMSVCのヘッダー・ライブラリを参照できるよう、以下のコマンドは「Developer PowerShell for VS 2022」または「x64 Native Tools Command Prompt for VS 2022」から起動したPowerShellで実行してください。
+
+AzooKeyのUIAccess起動には管理者権限が必要です。インストールと実行は管理者アカウントで行ってください。標準ユーザーから別の管理者資格情報を入力してインストールする構成は、現在サポートしていません。
 
 ### ビルド
 
@@ -59,27 +64,42 @@ git clone https://github.com/fkunn1326/azookey-Windows --recursive
 ```
 `--recursive`オプションを付けて、サブモジュールも一緒にクローンしてください。
 
-#### cargo-makeのインストール
-```
-cargo install --force cargo-make
+#### 初回セットアップ
+
+```powershell
+rustup target add i686-pc-windows-msvc
+cargo install cargo-make --version 0.37.24 --locked
+Push-Location frontend
+npm ci
+Pop-Location
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-build-assets.ps1
 ```
 
-#### ビルド
-```
-cargo make build [--debug/--release]
-```
-`--debug`オプションを付けるとデバッグビルド、`--release`オプションを付けるとリリースビルドになります。必ずどちらかを指定してください。
+最後のスクリプトは、ビルドに必要なllama.cpp b4846のCPU/CUDA/VulkanバイナリとZenzモデルをダウンロードし、Swiftのリンク用ライブラリも配置します。再取得する場合は`-Force`を付けてください。
 
-`build`フォルダーが作成され、ビルドされた実行ファイルが格納されます。
+#### リリースビルド
 
-`launcher.exe`を管理者権限で実行すると、azookeyの変換エンジンが起動します。
-
-また、IMEを登録する際は以下のように`regsvr32.exe`を使用して登録する必要があります。
-```c
-regsvr32.exe "path/to/build/azookey_windows.dll" /s
-regsvr32.exe "path/to/build/x86/azookey_windows.dll" /s
+```powershell
+cargo make build --release
 ```
-逆に登録を解除する場合は`/u`オプションを付けて実行してください。
+
+`build`フォルダーに実行ファイル一式が作成され、配布用インストーラーは`build\azookey-setup.exe`に出力されます。デバッグビルドでは引数を付けずに`cargo make build`を使用してください。
+
+#### インストール
+
+1. AzooKeyを使用中のメモ帳やブラウザーなどを終了します。
+2. 管理者アカウントで`build\azookey-setup.exe`を実行し、UACの確認を許可します。実行ファイルは管理者のみが変更できる`Program Files\Azookey`へ固定で配置されます。既存版がある場合も同じインストーラーで更新できます。
+3. 言語バーからAzooKeyを選択します。古いIME DLLがプロセスに保持されている場合は、サインアウトまたはWindowsの再起動後に確認してください。
+4. Zenzaiを使う場合は、AzooKeyの設定画面でZenzaiを有効にしてバックエンドを選択します。バックエンド変更後は、設定画面の案内どおりWindowsを再起動してください。
+
+インストーラーを使う方法を推奨します。開発中にDLLだけ手動登録する場合は、管理者権限のターミナルで次を実行してください。
+
+```powershell
+& "$env:WINDIR\System32\regsvr32.exe" "$PWD\build\azookey_windows.dll" /s
+& "$env:WINDIR\SysWOW64\regsvr32.exe" "$PWD\build\x86\azookey_windows.dll" /s
+```
+
+登録後、管理者権限のターミナルから`Start-Process "$PWD\build\launcher.exe"`を実行します。登録解除時は、同じ2つの`regsvr32`コマンドに`/u`を付けます。
 
 #### 開発時のヒント
 - 開発は仮想マシンまたは専用のPCで行うことを推奨します。IMEがクラッシュするとWindowsがフリーズする可能性があります。

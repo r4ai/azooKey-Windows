@@ -5,20 +5,23 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       with:
         submodules: recursive
 
     - name: Cache Rust
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
     - name: Install Swift
-      uses: compnerd/gha-setup-swift@main
+      uses: compnerd/gha-setup-swift@eeda069c5bc95ac8a9ac5cea7d4f588ae5420ca5 # main, 2026-07-13
       with:
         swift-version: swift-6.1.3-release
         swift-build: 6.1.3-RELEASE
@@ -28,48 +31,20 @@ jobs:
       uses: compnerd/gha-setup-vsdevenv@f1ba60d553a3216ce1b89abe0201213536bc7557 # v6
 
     - name: Install Protoc
-      uses: arduino/setup-protoc@v3
+      uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+      with:
+        version: "29.6"
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install Rust x86 target
+      run: rustup target add i686-pc-windows-msvc
 
     - name: Install cargo-make
-      run: cargo install --force cargo-make
+      run: cargo install cargo-make --version 0.37.24 --locked
 
-    - name: Download prebuilt llama
-      run: |
-        function Download-Extract {
-          param (
-            [string]$url,
-            [string]$destFolder
-          )
-          $tempZip = Join-Path $env:TEMP "llama_temp.zip"
-          Invoke-WebRequest -Uri $url -OutFile $tempZip
-          New-Item -Path $destFolder -ItemType Directory -Force
-          Expand-Archive -Path $tempZip -DestinationPath $destFolder -Force
-          Remove-Item $tempZip
-        }
-
-        # AzooKeyKanaKanjiConverter v0.11.2 imports the b4846 C ABI. Keep all
-        # runtime backends and the import library on that exact release.
-        $llamaVersion = "b4846"
-        $llamaReleaseBase = "https://github.com/fkunn1326/llama.cpp/releases/download/$llamaVersion"
-
-        # Create directories
-        $llamaCpuDir = "llama_cpu"
-        $llamaCudaDir = "llama_cuda"
-        $llamaVulkanDir = "llama_vulkan"
-        New-Item -Path $llamaCpuDir, $llamaCudaDir, $llamaVulkanDir -ItemType Directory -Force
-
-        # Download and extract files
-        Download-Extract -url "$llamaReleaseBase/llama-$llamaVersion-bin-win-avx-x64.zip" -destFolder $llamaCpuDir
-        Download-Extract -url "$llamaReleaseBase/llama-$llamaVersion-bin-win-cuda-cu12.4-x64.zip" -destFolder $llamaCudaDir
-        Download-Extract -url "$llamaReleaseBase/llama-$llamaVersion-bin-win-vulkan-x64.zip" -destFolder $llamaVulkanDir
-
-        # Copy llama.lib to server-swift
-        Copy-Item "$llamaCpuDir\llama.lib" -Destination "server-swift\" -Force
-
-        # Download the zenz model
-        $zenzUrl = "https://huggingface.co/Miwa-Keita/zenz-v3-small-gguf/resolve/main/ggml-model-Q5_K_M.gguf"
-        $zenzDest = "zenz.gguf"
-        Invoke-WebRequest -Uri $zenzUrl -OutFile $zenzDest
+    - name: Download inference build assets
+      shell: pwsh
+      run: .\scripts\setup-build-assets.ps1
 
     - name: Resolve and patch Zenzai inference dependency
       shell: pwsh
@@ -79,16 +54,23 @@ jobs:
         Pop-Location
         & .\scripts\patch-kkc.ps1 -PackagePath .\server-swift
 
+    - name: Set up Node.js
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: "24.18.0"
+        cache: npm
+        cache-dependency-path: frontend/package-lock.json
+
     - name: Install node dependencies
       run: |
         cd frontend
-        npm install
+        npm ci
 
     - name: Build
       run: cargo make build --release
 
     - name: Upload Setup Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: azookey-setup
         path: build/azookey-setup.exe

@@ -18,7 +18,9 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={userappdata}\{#MyAppName}
+DefaultDirName={autopf}\{#MyAppName}
+DisableDirPage=yes
+UsePreviousAppDir=no
 ; "ArchitecturesAllowed=x64compatible" specifies that Setup cannot run
 ; on anything but x64 and Windows 11 on Arm.
 ArchitecturesAllowed=x64compatible
@@ -45,22 +47,11 @@ Source: "../build/x86/azookey_windows.dll"; DestDir: "{app}"; DestName: "azookey
 Source: "../build/*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "../target/release/bundle/nsis/Azookey_0.1.0_x64-setup.exe"; Flags: dontcopy noencryption
 Source: "./Azookey Startup.xml"; Flags: dontcopy noencryption
+Source: "./SetupStartupTask.ps1"; Flags: dontcopy noencryption
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
-[Run]
-Filename: "icacls"; \
-  Parameters: "{app}\azookey.dll /grant ""*S-1-15-2-1:(RX)"""; \
-  Description: "Grant Permission"; \
-  Flags: runhidden postinstall runascurrentuser
-Filename: "icacls"; \
-  Parameters: "{app}\azookey32.dll /grant ""*S-1-15-2-1:(RX)"""; \
-  Description: "Grant Permission"; \
-  Flags: runhidden postinstall runascurrentuser
-
-[UninstallRun]
-Filename: "schtasks"; \
-  Parameters: "/Delete /TN ""Azookey Startup"" /F"; \
-  Flags: runhidden runascurrentuser
+[UninstallDelete]
+Type: files; Name: "{app}\launch.vbs"
 
 [Code]
 function InitializeSetup: Boolean;
@@ -95,59 +86,82 @@ begin
     end;
   end;
 end;
-procedure UpdateTaskXml();
+procedure ConfigureStartupTask();
 var
   TaskXmlPath: string;
-  TaskXmlContentAnsi: AnsiString;
-  TaskXmlContent: String;
-  Dummy: Integer;
+  SetupScriptPath: string;
+  Params: string;
+  ResultCode: Integer;
 begin
-  ExtractTemporaryFile('Azookey Startup.xml'); // ファイル展開
+  ExtractTemporaryFile('Azookey Startup.xml');
+  ExtractTemporaryFile('SetupStartupTask.ps1');
   TaskXmlPath := ExpandConstant('{tmp}\Azookey Startup.xml');
+  SetupScriptPath := ExpandConstant('{tmp}\SetupStartupTask.ps1');
+  Params :=
+    '-NoProfile -ExecutionPolicy Bypass -File "' + SetupScriptPath + '"' +
+    ' -TaskXmlTemplatePath "' + TaskXmlPath + '"' +
+    ' -LaunchVbsPath "' + ExpandConstant('{app}\launch.vbs') + '"' +
+    ' -LauncherPath "' + ExpandConstant('{app}\launcher.exe') + '"' +
+    ' -TaskName "Azookey Startup"';
 
-  LoadStringFromFile(TaskXmlPath, TaskXmlContentAnsi)
-
-  TaskXmlContent := String(TaskXmlContentAnsi);
-
-  StringChange(TaskXmlContent, 'PATH_TO_VBS', ExpandConstant('{app}\launch.vbs'));
-  TaskXmlContentAnsi := AnsiString(TaskXmlContent);
-  SaveStringToFile(TaskXmlPath, TaskXmlContentAnsi, False);
-
-  ShellExec('', 'schtasks', '/Create /F /TN "Azookey Startup" /XML "' + TaskXmlPath + '"', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-  ShellExec('', 'schtasks', '/Run /TN "Azookey Startup"', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-end;
-
-procedure CreateVbsFile();
-var
-  VbsFile: string;
-  VbsContent: AnsiString;
-begin
-  VbsFile := ExpandConstant('{app}\launch.vbs');
-  VbsContent :=
-    'Set objShell = CreateObject("WScript.Shell")' + #13#10 +
-    'objShell.Run "' + ExpandConstant('{app}\launcher.exe') + '", 0, False' + #13#10;
-
-  if SaveStringToFile(VbsFile, VbsContent, False) then
+  if not ShellExec('',
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Params, '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode) then
   begin
-    Log('VBS file created: ' + VbsFile);
-  end
-  else
+    RaiseException('Failed to start the AzooKey startup-task setup helper.');
+  end;
+  if ResultCode <> 0 then
   begin
-    Log('Failed to create VBS file: ' + VbsFile);
+    RaiseException(Format(
+      'AzooKey startup-task setup failed with exit code %d.', [ResultCode]));
   end;
 end;
 
-procedure UninstallAzookey();
+procedure GrantAppContainerReadExecute(FilePath: string);
 var
-  UninstallString: string;
-  Dummy: Integer;
+  Params: string;
+  ResultCode: Integer;
 begin
-  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Azookey', 'UninstallString', UninstallString) then
+  Params := '"' + FilePath + '" /grant "*S-1-15-2-1:(RX)"';
+  if not ShellExec('', ExpandConstant('{sys}\icacls.exe'), Params, '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode) then
   begin
-    if UninstallString <> '' then
-    begin
-      ShellExec('', UninstallString, '', '', SW_HIDE, ewWaitUntilTerminated, Dummy);
-    end;
+    RaiseException('Failed to start icacls for ' + FilePath + '.');
+  end;
+  if ResultCode <> 0 then
+  begin
+    RaiseException(Format(
+      'icacls failed for %s with exit code %d.', [FilePath, ResultCode]));
+  end;
+end;
+
+procedure RemoveStartupTask();
+var
+  QueryResult: Integer;
+  DeleteResult: Integer;
+begin
+  if not ShellExec('', ExpandConstant('{sys}\schtasks.exe'),
+    '/Query /TN "Azookey Startup"', '',
+    SW_HIDE, ewWaitUntilTerminated, QueryResult) then
+  begin
+    RaiseException('Failed to query the AzooKey startup task.');
+  end;
+
+  { A nonzero query result means that the task is already absent. }
+  if QueryResult <> 0 then
+    Exit;
+
+  if not ShellExec('', ExpandConstant('{sys}\schtasks.exe'),
+    '/Delete /TN "Azookey Startup" /F', '', SW_HIDE,
+    ewWaitUntilTerminated, DeleteResult) then
+  begin
+    RaiseException('Failed to start removal of the AzooKey startup task.');
+  end;
+  if DeleteResult <> 0 then
+  begin
+    RaiseException(Format(
+      'AzooKey startup-task removal failed with exit code %d.', [DeleteResult]));
   end;
 end;
 
@@ -156,8 +170,9 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    CreateVbsFile();
-    UpdateTaskXml();
+    GrantAppContainerReadExecute(ExpandConstant('{app}\azookey.dll'));
+    GrantAppContainerReadExecute(ExpandConstant('{app}\azookey32.dll'));
+    ConfigureStartupTask();
   end;
 end;
 
@@ -169,8 +184,8 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if CurUninstallStep = usPostUninstall then
+  if CurUninstallStep = usUninstall then
   begin
-    UninstallAzookey();
+    RemoveStartupTask();
   end;
 end;

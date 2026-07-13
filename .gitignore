@@ -1,5 +1,11 @@
 target
 build
+llama_cpu
+llama_cuda
+llama_vulkan
+.azookey-assets-*
+.azookey-backup-*
+.azookey-build-*
 scripts/*.exe
 logs/*
 .idea

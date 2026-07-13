@@ -42,6 +42,8 @@ description = "Copy necessary files"
 script_runner = "powershell"
 script_extension = "ps1"
 script  = """
+$ErrorActionPreference = "Stop"
+
 $str=$args[0]
 if ([string]::IsNullOrEmpty($str)) {
     $str = "debug"
@@ -49,32 +51,98 @@ if ([string]::IsNullOrEmpty($str)) {
     $str=$str.Substring(2)
 }
 
+$workspaceRoot = (Get-Location).Path.TrimEnd('\\')
+$buildDir = [System.IO.Path]::GetFullPath((Join-Path $workspaceRoot "build"))
+$id = [guid]::NewGuid().ToString("N")
+$stagingDir = Join-Path $workspaceRoot ".azookey-build-staging-$id"
+$backupDir = Join-Path $workspaceRoot ".azookey-build-backup-$id"
 
-mkdir build/x86 -Force
+function Remove-WorkspaceChildDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
 
-cp target/$str/ui.exe build
-cp target/$str/azookey-server.exe build
-cp target/$str/azookey_windows.dll build
-cp target/$str/launcher.exe build
+    $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\\')
+    $parentPath = [System.IO.Directory]::GetParent($fullPath).FullName.TrimEnd('\\')
+    if (-not $parentPath.Equals($workspaceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove a directory outside the workspace: $fullPath"
+    }
+    if ([System.IO.Directory]::Exists($fullPath)) {
+        [System.IO.Directory]::Delete($fullPath, $true)
+    }
+}
 
+try {
+    New-Item -Path (Join-Path $stagingDir "x86") -ItemType Directory -Force | Out-Null
 
-cp target/i686-pc-windows-msvc/$str/azookey_windows.dll build/x86
+    Copy-Item -LiteralPath "target/$str/ui.exe" -Destination $stagingDir
+    Copy-Item -LiteralPath "target/$str/azookey-server.exe" -Destination $stagingDir
+    Copy-Item -LiteralPath "target/$str/azookey_windows.dll" -Destination $stagingDir
+    Copy-Item -LiteralPath "target/$str/launcher.exe" -Destination $stagingDir
+    Copy-Item -LiteralPath "target/i686-pc-windows-msvc/$str/azookey_windows.dll" `
+        -Destination (Join-Path $stagingDir "x86")
+    Copy-Item -LiteralPath "server-swift/.build/x86_64-unknown-windows-msvc/release/azookey-server.dll" `
+        -Destination $stagingDir
 
-cp server-swift/.build/x86_64-unknown-windows-msvc/release/azookey-server.dll build
+    Copy-Item -LiteralPath "llama_cpu" -Destination (Join-Path $stagingDir "llama_cpu") -Recurse
+    Copy-Item -LiteralPath "llama_cuda" -Destination (Join-Path $stagingDir "llama_cuda") -Recurse
+    Copy-Item -LiteralPath "llama_vulkan" -Destination (Join-Path $stagingDir "llama_vulkan") -Recurse
 
-cp -Recurse -Force llama_cpu build
-cp -Recurse -Force llama_cuda build
-cp -Recurse -Force llama_vulkan build
+    $swiftTargetInfoJson = & swift -print-target-info
+    if ($LASTEXITCODE -ne 0) {
+        throw "swift -print-target-info failed with exit code $LASTEXITCODE."
+    }
+    $swiftTargetInfo = $swiftTargetInfoJson | Out-String | ConvertFrom-Json
+    $swiftRuntimeBin = @($swiftTargetInfo.paths.runtimeLibraryPaths) |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_ "swiftCore.dll") } |
+        Select-Object -First 1
+    if ([string]::IsNullOrEmpty($swiftRuntimeBin)) {
+        throw "Could not find the runtime bin directory for the active Swift toolchain."
+    }
+    Get-ChildItem -LiteralPath $swiftRuntimeBin -Force |
+        Copy-Item -Destination $stagingDir -Recurse -Force
 
-cp $env:APPDATA/../Local/Programs/Swift/Runtimes/*/usr/bin/* build
+    Copy-Item -LiteralPath "server-swift/azooKey_emoji_dictionary_storage/EmojiDictionary" `
+        -Destination (Join-Path $stagingDir "EmojiDictionary") -Recurse
+    Copy-Item -LiteralPath "server-swift/azooKey_dictionary_storage/Dictionary" `
+        -Destination (Join-Path $stagingDir "Dictionary") -Recurse
+    Copy-Item -LiteralPath "zenz.gguf" -Destination $stagingDir
 
-cp -Recurse -Force server-swift/azooKey_emoji_dictionary_storage/EmojiDictionary build
-cp -Recurse -Force server-swift/azooKey_dictionary_storage/Dictionary build
+    & icacls.exe (Join-Path $stagingDir "azookey_windows.dll") /grant "*S-1-15-2-1:(RX)"
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed for the x64 IME DLL with exit code $LASTEXITCODE."
+    }
+    & icacls.exe (Join-Path $stagingDir "x86/azookey_windows.dll") /grant "*S-1-15-2-1:(RX)"
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed for the x86 IME DLL with exit code $LASTEXITCODE."
+    }
 
-cp zenz.gguf build
+    if ([System.IO.Directory]::Exists($buildDir)) {
+        Move-Item -LiteralPath $buildDir -Destination $backupDir
+    }
+    try {
+        Move-Item -LiteralPath $stagingDir -Destination $buildDir
+    }
+    catch {
+        if (-not (Test-Path -LiteralPath $buildDir) -and
+            (Test-Path -LiteralPath $backupDir -PathType Container)) {
+            Move-Item -LiteralPath $backupDir -Destination $buildDir
+        }
+        throw
+    }
 
-icacls build/azookey_windows.dll /grant "*S-1-15-2-1:(RX)"
-icacls build/x86/azookey_windows.dll /grant "*S-1-15-2-1:(RX)"
+    if (Test-Path -LiteralPath $backupDir -PathType Container) {
+        try {
+            Remove-WorkspaceChildDirectory $backupDir
+        }
+        catch {
+            Write-Warning "The previous build remains at $backupDir and can be removed after closing processes that use it."
+        }
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $stagingDir -PathType Container) {
+        Remove-WorkspaceChildDirectory $stagingDir
+    }
+}
 """
 args = ["${@}"]
 
