@@ -59,6 +59,22 @@ function Resolve-RequiredCommand {
     return $command.Source
 }
 
+function Resolve-KnownFolder {
+    param(
+        [Parameter(Mandatory = $true)][string]$EnvironmentVariable,
+        [Parameter(Mandatory = $true)][Environment+SpecialFolder]$SpecialFolder
+    )
+
+    $path = [Environment]::GetEnvironmentVariable($EnvironmentVariable)
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        $path = [Environment]::GetFolderPath($SpecialFolder)
+    }
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        throw "Windows known folder $SpecialFolder could not be resolved."
+    }
+    return $path
+}
+
 function Resolve-SwiftExecutable {
     function Test-SwiftCandidate {
         param([Parameter(Mandatory = $true)][string]$Path)
@@ -79,7 +95,10 @@ function Resolve-SwiftExecutable {
         return $command.Source
     }
 
-    $toolchainsRoot = Join-Path $env:LOCALAPPDATA "Programs\Swift\Toolchains"
+    $localAppData = Resolve-KnownFolder `
+        -EnvironmentVariable "LOCALAPPDATA" `
+        -SpecialFolder ([Environment+SpecialFolder]::LocalApplicationData)
+    $toolchainsRoot = Join-Path $localAppData "Programs\Swift\Toolchains"
     if (Test-Path -LiteralPath $toolchainsRoot -PathType Container) {
         $candidates = Get-ChildItem -LiteralPath $toolchainsRoot -Directory |
             Sort-Object Name -Descending |
@@ -103,7 +122,10 @@ function Resolve-MsvcDevCmd {
         return $null
     }
 
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    $programFilesX86 = Resolve-KnownFolder `
+        -EnvironmentVariable "ProgramFiles(x86)" `
+        -SpecialFolder ([Environment+SpecialFolder]::ProgramFilesX86)
+    $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
         throw "vswhere.exe was not found. Install Visual Studio 2022 Build Tools with Desktop development with C++."
     }
