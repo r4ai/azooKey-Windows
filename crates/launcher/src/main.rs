@@ -1,11 +1,14 @@
+mod runtime_log;
+
 use anyhow::{bail, Context as _};
+use runtime_log::{read_bounded_lines, RuntimeLog, CHILD_OUTPUT_MAX_BYTES};
 use shared::AppConfig;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
-use std::{env, thread};
+use std::{env, panic, thread};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -18,22 +21,68 @@ struct RuntimePaths {
 }
 
 fn main() -> anyhow::Result<()> {
+    let runtime_log = RuntimeLog::open();
+    runtime_log.record(format!(
+        "session=start launcher_pid={} version={}",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION")
+    ));
+    install_panic_logger(runtime_log.clone());
+
+    let result = run(&runtime_log);
+    match &result {
+        Ok(()) => runtime_log.record("session=end outcome=success"),
+        Err(error) => runtime_log.record(format!(
+            "session=end outcome=error launcher_error={error:#}"
+        )),
+    }
+    result
+}
+
+fn run(runtime_log: &RuntimeLog) -> anyhow::Result<()> {
     let config = AppConfig::new();
     let current_exe = env::current_exe().context("failed to locate launcher.exe")?;
     let paths = runtime_paths(&current_exe, &config.zenzai.backend)?;
+    runtime_log.record(format!(
+        "configuration backend={} app_dir={}",
+        config.zenzai.backend,
+        paths.app_dir.display()
+    ));
 
     prepend_to_path(&paths.backend_dir)?;
 
-    let mut server = start_process(&paths.server, &paths.app_dir, "[server]")?;
-    let mut ui = match start_process(&paths.ui, &paths.app_dir, "[ui]") {
+    let mut server = start_process(
+        &paths.server,
+        &paths.app_dir,
+        "azookey-server.exe",
+        runtime_log,
+    )?;
+    let mut ui = match start_process(&paths.ui, &paths.app_dir, "ui.exe", runtime_log) {
         Ok(ui) => ui,
         Err(error) => {
-            let _ = terminate_process_tree(&mut server);
+            match terminate_process_tree(&mut server) {
+                Ok(()) => runtime_log.record(format!(
+                    "process=stop name=azookey-server.exe pid={} reason=ui-start-failed",
+                    server.id()
+                )),
+                Err(cleanup_error) => runtime_log.record(format!(
+                    "process=stop-failed name=azookey-server.exe pid={} reason=ui-start-failed error={cleanup_error:#}",
+                    server.id()
+                )),
+            }
             return Err(error);
         }
     };
 
-    supervise_processes(&mut server, &mut ui)
+    supervise_processes(&mut server, &mut ui, runtime_log)
+}
+
+fn install_panic_logger(runtime_log: RuntimeLog) {
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        runtime_log.record(format!("launcher=panic detail={panic_info}"));
+        previous_hook(panic_info);
+    }));
 }
 
 fn runtime_paths(current_exe: &Path, configured_backend: &str) -> anyhow::Result<RuntimePaths> {
@@ -67,49 +116,112 @@ fn prepend_to_path(directory: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn start_process(exe: &Path, app_dir: &Path, prefix: &str) -> anyhow::Result<Child> {
+fn start_process(
+    exe: &Path,
+    app_dir: &Path,
+    process_name: &'static str,
+    runtime_log: &RuntimeLog,
+) -> anyhow::Result<Child> {
     let mut child = Command::new(exe)
         .current_dir(app_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to start {}", exe.display()))?;
+    let child_id = child.id();
+    runtime_log.record(format!(
+        "process=start name={process_name} pid={child_id} exe={}",
+        exe.display()
+    ));
 
     let stdout = child
         .stdout
         .take()
         .context("failed to capture child stdout")?;
-    let stdout_reader = BufReader::new(stdout);
-    let prefix_stdout = prefix.to_string();
-    thread::spawn(move || {
-        for line in stdout_reader.lines().map_while(Result::ok) {
-            println!("{}: {}", prefix_stdout, line);
-        }
-    });
+    start_output_reader(
+        stdout,
+        runtime_log.clone(),
+        process_name,
+        child_id,
+        "stdout",
+    );
 
     let stderr = child
         .stderr
         .take()
         .context("failed to capture child stderr")?;
-    let stderr_reader = BufReader::new(stderr);
-    let prefix_stderr = prefix.to_string();
-    thread::spawn(move || {
-        for line in stderr_reader.lines().map_while(Result::ok) {
-            eprintln!("{}: {}", prefix_stderr, line);
-        }
-    });
+    start_output_reader(
+        stderr,
+        runtime_log.clone(),
+        process_name,
+        child_id,
+        "stderr",
+    );
 
     Ok(child)
 }
 
-fn supervise_processes(server: &mut Child, ui: &mut Child) -> anyhow::Result<()> {
+fn start_output_reader<R>(
+    output: R,
+    runtime_log: RuntimeLog,
+    process_name: &'static str,
+    process_id: u32,
+    stream: &'static str,
+) where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(output);
+        let read_result = read_bounded_lines(&mut reader, CHILD_OUTPUT_MAX_BYTES, |line| {
+            if stream == "stderr" {
+                eprintln!("[{process_name}]: {line}");
+            } else {
+                println!("[{process_name}]: {line}");
+            }
+            runtime_log.record(format!(
+                "child-output process={process_name} pid={process_id} stream={stream} text={line}"
+            ));
+        });
+        if let Err(error) = read_result {
+            runtime_log.record(format!(
+                "child-output-reader=error process={process_name} pid={process_id} stream={stream} error={error}"
+            ));
+        }
+    });
+}
+
+fn supervise_processes(
+    server: &mut Child,
+    ui: &mut Child,
+    runtime_log: &RuntimeLog,
+) -> anyhow::Result<()> {
     loop {
         if let Some(status) = server.try_wait().context("failed to query server status")? {
             let cleanup_error = terminate_process_tree(ui).err();
+            runtime_log.record(format!(
+                "process=unexpected-exit name=azookey-server.exe pid={} status={} companion=ui.exe companion_pid={} cleanup_error={}",
+                server.id(),
+                status,
+                ui.id(),
+                cleanup_error
+                    .as_ref()
+                    .map(|error| format!("{error:#}"))
+                    .unwrap_or_else(|| "none".to_string())
+            ));
             return unexpected_exit("azookey-server.exe", status, "ui.exe", cleanup_error);
         }
         if let Some(status) = ui.try_wait().context("failed to query UI status")? {
             let cleanup_error = terminate_process_tree(server).err();
+            runtime_log.record(format!(
+                "process=unexpected-exit name=ui.exe pid={} status={} companion=azookey-server.exe companion_pid={} cleanup_error={}",
+                ui.id(),
+                status,
+                server.id(),
+                cleanup_error
+                    .as_ref()
+                    .map(|error| format!("{error:#}"))
+                    .unwrap_or_else(|| "none".to_string())
+            ));
             return unexpected_exit("ui.exe", status, "azookey-server.exe", cleanup_error);
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
@@ -200,7 +312,7 @@ mod tests {
 
         let mut server = spawn_test_child("exit");
         let mut ui = spawn_test_child("wait");
-        let error = supervise_processes(&mut server, &mut ui).unwrap_err();
+        let error = supervise_processes(&mut server, &mut ui, &RuntimeLog::disabled()).unwrap_err();
 
         assert!(error
             .to_string()
@@ -216,7 +328,7 @@ mod tests {
 
         let mut server = spawn_test_child("wait");
         let mut ui = spawn_test_child("exit");
-        let error = supervise_processes(&mut server, &mut ui).unwrap_err();
+        let error = supervise_processes(&mut server, &mut ui, &RuntimeLog::disabled()).unwrap_err();
 
         assert!(error.to_string().contains("ui.exe exited unexpectedly"));
         assert!(server.try_wait().unwrap().is_some());

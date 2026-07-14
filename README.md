@@ -96,6 +96,12 @@ $log = Get-ChildItem "$env:LOCALAPPDATA\Azookey\logs\client\client-*.log" |
 Get-Content $log.FullName -Tail 200
 ```
 
+launcher、変換server、候補UIの起動・終了と標準出力は`%LOCALAPPDATA%\Azookey\logs\runtime.log`に保存され、1 MiBを超える前に`runtime.log.1`へローテーションします。起動直後にserver/UIが終了する場合は次のコマンドで確認できます。
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\Azookey\logs\runtime.log" -Tail 200
+```
+
 インストーラーを使う方法を推奨します。開発中にDLLだけ手動登録する場合は、管理者権限のターミナルで次を実行してください。
 
 ```powershell
