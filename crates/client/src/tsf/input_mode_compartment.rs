@@ -42,15 +42,15 @@ fn compartment_updates(mode: InputMode) -> &'static [CompartmentUpdate] {
 
 fn input_mode_from_compartments(
     open_close: Option<i32>,
-    _conversion_mode: Option<i32>,
+    conversion_mode: Option<i32>,
 ) -> InputMode {
     let is_open = open_close.unwrap_or(0) != 0;
+    let conversion_mode = conversion_mode.unwrap_or(HIRAGANA_CONVERSION_MODE) as u32;
 
-    // AzooKey exposes only an open Kana mode and a closed Latin mode. Other TIPs can leave
-    // their conversion flags (notably 0 for Microsoft IME's "A" state) in the thread-wide
-    // compartment when the user selects AzooKey. Requiring NATIVE here would immediately turn
-    // an otherwise successful open request back into Latin, so OPENCLOSE is authoritative.
-    if is_open {
+    // Open/close and native/alphanumeric are independent TSF state. Activation normalizes a
+    // conversion value inherited from another TIP before this reduction, while later external
+    // conversion changes remain observable through the advised compartment sink.
+    if is_open && conversion_mode & TF_CONVERSIONMODE_NATIVE != 0 {
         InputMode::Kana
     } else {
         InputMode::Latin
@@ -541,7 +541,7 @@ mod tests {
         );
         assert_eq!(
             input_mode_from_compartments(Some(1), Some(0)),
-            InputMode::Kana
+            InputMode::Latin
         );
         assert_eq!(
             input_mode_from_compartments(Some(0), Some(0)),

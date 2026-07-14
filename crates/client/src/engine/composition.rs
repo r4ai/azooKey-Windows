@@ -343,8 +343,8 @@ impl TextServiceFactory {
         }
 
         // Mode commands are valid in every composition state, including candidate selection.
-        // Handling them before the state-specific key table also keeps F3/F4 explicitly
-        // idempotent instead of treating both as a blind toggle.
+        // F3/F4 are the two Windows representations of the physical Hankaku/Zenkaku command
+        // and therefore both toggle; IME_ON/OFF and the other DBE aliases remain explicit.
         let requested_mode = match &action {
             UserAction::SetInputMode(requested_mode) => Some(*requested_mode),
             UserAction::ToggleInputMode => Some(mode.toggled()),

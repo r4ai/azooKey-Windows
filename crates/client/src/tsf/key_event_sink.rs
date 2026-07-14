@@ -4,7 +4,7 @@ use windows::{
         Foundation::{BOOL, LPARAM, WPARAM},
         System::Ole::CONNECT_E_NOCONNECTION,
         UI::{
-            Input::KeyboardAndMouse::{VK_BACK, VK_CONTROL, VK_KANJI, VK_MENU, VK_OEM_3, VK_SHIFT},
+            Input::KeyboardAndMouse::{VK_BACK, VK_CONTROL, VK_KANJI, VK_OEM_3, VK_SHIFT},
             TextServices::{
                 ITfContext, ITfKeyEventSink_Impl, ITfKeystrokeMgr, TF_MOD_ALT,
                 TF_MOD_IGNORE_ALL_MODIFIER, TF_PRESERVEDKEY,
@@ -21,6 +21,7 @@ use crate::{diagnostics, extension::VKeyExt as _, globals::GUID_PRESERVED_KEY_IN
 use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
 const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
+const ALT_CONTEXT_BIT: usize = 1 << 29;
 const PRESERVED_ALT_GRAVE: u8 = 1 << 0;
 const PRESERVED_KANJI: u8 = 1 << 1;
 const INPUT_MODE_PRESERVED_KEYS: [(u8, TF_PRESERVEDKEY); 2] = [
@@ -42,6 +43,10 @@ const INPUT_MODE_PRESERVED_KEYS: [(u8, TF_PRESERVEDKEY); 2] = [
 
 fn is_key_repeat(lparam: LPARAM) -> bool {
     lparam.0 as usize & PREVIOUS_KEY_STATE_BIT != 0
+}
+
+fn has_alt_context(lparam: LPARAM) -> bool {
+    lparam.0 as usize & ALT_CONTEXT_BIT != 0
 }
 
 fn is_backspace(wparam: WPARAM) -> bool {
@@ -79,6 +84,11 @@ fn should_use_direct_alt_grave(
         && preserved_keys & PRESERVED_ALT_GRAVE == 0
 }
 
+fn should_defer_to_preserved_key(wparam: WPARAM, alt_pressed: bool, preserved_keys: u8) -> bool {
+    (wparam.0 == VK_OEM_3.0 as usize && alt_pressed && preserved_keys & PRESERVED_ALT_GRAVE != 0)
+        || (wparam.0 == VK_KANJI.0 as usize && preserved_keys & PRESERVED_KANJI != 0)
+}
+
 fn should_log_input_mode_key(wparam: WPARAM, alt_pressed: bool) -> bool {
     matches!(
         wparam.0,
@@ -90,10 +100,10 @@ fn log_mode_key_event(
     stage: &'static str,
     route: &'static str,
     wparam: WPARAM,
+    alt_pressed: bool,
     preserved_keys: u8,
     eaten: bool,
 ) {
-    let alt_pressed = VK_MENU.is_pressed();
     if !should_log_input_mode_key(wparam, alt_pressed) {
         return;
     }
@@ -115,19 +125,18 @@ fn log_mode_key_event(
 
 impl TextServiceFactory {
     pub(super) fn preserve_input_mode_keys(&self) -> Result<()> {
-        let (thread_mgr, tid, registered) = {
+        let (thread_mgr, tid) = {
             let text_service = self.borrow()?;
-            (
-                text_service.thread_mgr()?,
-                text_service.tid,
-                text_service.preserved_input_mode_keys,
-            )
+            (text_service.thread_mgr()?, text_service.tid)
         };
         let keystroke_mgr = thread_mgr.cast::<ITfKeystrokeMgr>()?;
         let mut first_error = None;
 
         for (marker, key) in INPUT_MODE_PRESERVED_KEYS {
-            if registered & marker != 0 {
+            // PreserveKey is an external COM call and can re-enter. Read the current mask for
+            // every key rather than using an activation-time snapshot, so a key registered by
+            // a nested call is not registered again and then accidentally marked unowned.
+            if self.borrow()?.preserved_input_mode_keys & marker != 0 {
                 continue;
             }
 
@@ -187,18 +196,21 @@ impl TextServiceFactory {
     }
 
     pub(super) fn unpreserve_input_mode_keys(&self) -> Result<()> {
-        let (thread_mgr, registered) = {
-            let text_service = self.borrow()?;
-            (
-                text_service.thread_mgr()?,
-                text_service.preserved_input_mode_keys,
-            )
-        };
+        let registered = self.borrow()?.preserved_input_mode_keys;
         if registered == 0 {
             return Ok(());
         }
 
-        let keystroke_mgr = thread_mgr.cast::<ITfKeystrokeMgr>()?;
+        let keystroke_mgr = match (|| -> Result<ITfKeystrokeMgr> {
+            let thread_mgr = self.borrow()?.thread_mgr()?;
+            Ok(thread_mgr.cast()?)
+        })() {
+            Ok(keystroke_mgr) => keystroke_mgr,
+            Err(error) => {
+                self.borrow_mut()?.preserved_input_mode_keys &= !registered;
+                return Err(error);
+            }
+        };
         let mut first_error = None;
         for (marker, key) in INPUT_MODE_PRESERVED_KEYS {
             if registered & marker == 0 {
@@ -207,9 +219,6 @@ impl TextServiceFactory {
 
             match unsafe { keystroke_mgr.UnpreserveKey(&GUID_PRESERVED_KEY_INPUT_MODE, &key) } {
                 Ok(()) => {
-                    let mut text_service = self.borrow_mut()?;
-                    text_service.preserved_input_mode_keys =
-                        with_preserved_key(text_service.preserved_input_mode_keys, marker, false);
                     diagnostics::event(
                         "unpreserve_key",
                         format_args!("vk={} modifiers={} status=ok", key.uVKey, key.uModifiers),
@@ -218,9 +227,6 @@ impl TextServiceFactory {
                 Err(error) if error.code() == CONNECT_E_NOCONNECTION => {
                     // The registration is already absent (for example, after TSF performed
                     // external cleanup). Treat that as successful teardown.
-                    let mut text_service = self.borrow_mut()?;
-                    text_service.preserved_input_mode_keys =
-                        with_preserved_key(text_service.preserved_input_mode_keys, marker, false);
                     diagnostics::event(
                         "unpreserve_key",
                         format_args!(
@@ -251,6 +257,11 @@ impl TextServiceFactory {
             }
         }
 
+        // Deactivate is called immediately before TSF releases its final reference to this
+        // service. Even if TSF rejected explicit removal, stop retaining ownership so teardown
+        // can unadvise the key sink and release ITfThreadMgr.
+        self.borrow_mut()?.preserved_input_mode_keys &= !registered;
+
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -277,17 +288,29 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
             return Ok(true.into());
         }
 
+        let preserved_keys = self.borrow()?.preserved_input_mode_keys;
+        let alt_pressed = has_alt_context(lparam);
+        if should_defer_to_preserved_key(wparam, alt_pressed, preserved_keys) {
+            log_mode_key_event(
+                "test_down",
+                "preserved_owned",
+                wparam,
+                alt_pressed,
+                preserved_keys,
+                false,
+            );
+            return Ok(false.into());
+        }
+
         // Composition recovery and external compartment changes are finalized only from the
         // real OnKeyDown safe point. Claim one test event so handle_key can safely retry them.
         if should_claim_pending_cleanup(pic.is_some(), self.has_pending_key_cleanup()?) {
             return Ok(true.into());
         }
-
-        let preserved_keys = self.borrow()?.preserved_input_mode_keys;
         if pic.is_some()
             && should_use_direct_alt_grave(
                 wparam,
-                VK_MENU.is_pressed(),
+                alt_pressed,
                 VK_CONTROL.is_pressed(),
                 preserved_keys,
             )
@@ -296,6 +319,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
                 "test_down",
                 "direct_alt_grave",
                 wparam,
+                alt_pressed,
                 preserved_keys,
                 true,
             );
@@ -305,7 +329,14 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         // this function checks if the key event will be handled by "OnKeyUp" function
         // so we need to return TRUE if we want to handle the key event
         let result = self.process_key(pic, wparam)?.is_some();
-        log_mode_key_event("test_down", "key_sink", wparam, preserved_keys, result);
+        log_mode_key_event(
+            "test_down",
+            "key_sink",
+            wparam,
+            alt_pressed,
+            preserved_keys,
+            result,
+        );
 
         Ok(result.into())
     }
@@ -325,9 +356,21 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         }
 
         let preserved_keys = self.borrow()?.preserved_input_mode_keys;
+        let alt_pressed = has_alt_context(lparam);
+        if should_defer_to_preserved_key(wparam, alt_pressed, preserved_keys) {
+            log_mode_key_event(
+                "key_down",
+                "preserved_owned",
+                wparam,
+                alt_pressed,
+                preserved_keys,
+                false,
+            );
+            return Ok(false.into());
+        }
         let direct_alt_grave = should_use_direct_alt_grave(
             wparam,
-            VK_MENU.is_pressed(),
+            alt_pressed,
             VK_CONTROL.is_pressed(),
             preserved_keys,
         );
@@ -344,6 +387,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
                 "key_sink"
             },
             wparam,
+            alt_pressed,
             preserved_keys,
             result,
         );
@@ -421,6 +465,13 @@ mod tests {
     }
 
     #[test]
+    fn alt_context_comes_from_the_key_message() {
+        assert!(!has_alt_context(LPARAM(0)));
+        assert!(has_alt_context(LPARAM(ALT_CONTEXT_BIT as isize)));
+        assert!(!has_alt_context(LPARAM(PREVIOUS_KEY_STATE_BIT as isize)));
+    }
+
+    #[test]
     fn pending_cleanup_is_claimed_before_ipc_key_classification() {
         assert!(should_claim_pending_cleanup(true, true));
         assert!(!should_claim_pending_cleanup(true, false));
@@ -457,6 +508,25 @@ mod tests {
             PRESERVED_ALT_GRAVE
         ));
         assert!(!should_use_direct_alt_grave(WPARAM(0x41), true, false, 0));
+    }
+
+    #[test]
+    fn owned_preserved_keys_are_not_dispatched_twice() {
+        let grave = WPARAM(VK_OEM_3.0 as usize);
+        let kanji = WPARAM(VK_KANJI.0 as usize);
+
+        assert!(should_defer_to_preserved_key(
+            grave,
+            true,
+            PRESERVED_ALT_GRAVE
+        ));
+        assert!(!should_defer_to_preserved_key(
+            grave,
+            false,
+            PRESERVED_ALT_GRAVE
+        ));
+        assert!(should_defer_to_preserved_key(kanji, false, PRESERVED_KANJI));
+        assert!(!should_defer_to_preserved_key(kanji, false, 0));
     }
 
     #[test]

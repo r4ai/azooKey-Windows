@@ -120,9 +120,6 @@ impl TextServiceFactory {
     }
 
     fn unadvise_key_event_sink(&self) -> Result<()> {
-        if self.borrow()?.preserved_input_mode_keys != 0 {
-            anyhow::bail!("input-mode preserved keys remain registered; retaining key-event sink");
-        }
         if !self.borrow()?.key_event_sink_advised {
             return Ok(());
         }
@@ -191,24 +188,7 @@ impl TextServiceFactory {
         Ok(())
     }
 
-    fn has_live_tsf_resources(&self) -> Result<bool> {
-        let text_service = self.borrow()?;
-        let has_active_composition = text_service.borrow_composition()?.tip_composition.is_some();
-        Ok(has_active_composition
-            || text_service.key_event_sink_advised
-            || text_service.preserved_input_mode_keys != 0
-            || text_service.thread_mgr_event_cookie.is_some()
-            || text_service.text_layout_cookie.is_some()
-            || text_service.lang_bar_added
-            || text_service.open_close_cookie.is_some()
-            || text_service.conversion_mode_cookie.is_some())
-    }
-
-    fn release_dll_ref_if_unused(&self) -> Result<()> {
-        if self.has_live_tsf_resources()? {
-            return Ok(());
-        }
-
+    fn release_activation_dll_ref(&self) -> Result<()> {
         let dll_ref_held = self.borrow()?.dll_ref_held;
         if dll_ref_held {
             let mut dll_instance = DllModule::get()?;
@@ -218,11 +198,7 @@ impl TextServiceFactory {
         Ok(())
     }
 
-    fn clear_deactivated_state_if_unused(&self) -> Result<()> {
-        if self.has_live_tsf_resources()? || self.borrow()?.dll_ref_held {
-            return Ok(());
-        }
-
+    fn clear_deactivated_state(&self) -> Result<()> {
         if let Some(mut ipc_service) = IMEState::ipc_snapshot() {
             // Some hosts do not send OnCompositionTerminated after a successful EndComposition.
             // Do not perform conversion IPC during Deactivate; make the next focused stateful
@@ -235,10 +211,14 @@ impl TextServiceFactory {
 
         let mut text_service = self.borrow_mut()?;
         // EndComposition is allowed to succeed without a synchronous termination callback.
-        // Once all TSF registrations and the DLL reference are gone, no live range remains;
-        // clear every local preedit field so a later Activate cannot inherit stale state. A late
-        // callback performs the same reset again and merely advances the generation once more.
-        text_service.borrow_mut_composition()?.reset();
+        // Deactivate is TSF's final shutdown callback and must release the ITfThreadMgr passed
+        // to Activate before returning, even if an external unadvise operation reported an
+        // error. Clear every owned reference and marker; TSF will discard any registration it
+        // already removed externally, and no retry callback is guaranteed after this point.
+        // Release the Activate(ptim) reference first so even a later local-state cleanup error
+        // cannot violate the Deactivate contract.
+        text_service.tid = 0;
+        text_service.thread_mgr = None;
         text_service.display_attribute_atom.clear();
         text_service.context = None;
         text_service.thread_mgr_event_cookie = None;
@@ -252,8 +232,7 @@ impl TextServiceFactory {
         text_service.pending_input_mode_transition.set(None);
         text_service.pending_composition_cleanup.set(false);
         text_service.compartment_write_in_progress = false;
-        text_service.tid = 0;
-        text_service.thread_mgr = None;
+        text_service.borrow_mut_composition()?.reset();
         Ok(())
     }
 }
@@ -481,13 +460,13 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         );
         keep_first_error(
             &mut first_error,
-            "Release DLL reference",
-            self.release_dll_ref_if_unused(),
+            "Clear deactivated TextService state",
+            self.clear_deactivated_state(),
         );
         keep_first_error(
             &mut first_error,
-            "Clear deactivated TextService state",
-            self.clear_deactivated_state_if_unused(),
+            "Release DLL reference",
+            self.release_activation_dll_ref(),
         );
 
         if let Some(error) = first_error {
@@ -495,14 +474,14 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                 diagnostics::event(
                     "deactivate_finish",
                     format_args!(
-                        "status=retryable_error preserved_mask={} key_sink={}",
-                        text_service.preserved_input_mode_keys, text_service.key_event_sink_advised
+                        "status=error preserved_mask={} key_sink={} thread_manager={}",
+                        text_service.preserved_input_mode_keys,
+                        text_service.key_event_sink_advised,
+                        text_service.thread_mgr.is_some()
                     ),
                 );
             }
-            tracing::warn!(
-                "Deactivate completed with retryable TSF registrations retained: {error:?}"
-            );
+            tracing::warn!("Deactivate completed with teardown errors: {error:?}");
             Err(error)
         } else {
             diagnostics::event("deactivate_finish", format_args!("status=ok"));
