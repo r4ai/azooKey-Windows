@@ -1,3 +1,4 @@
+mod diagnostics;
 mod engine;
 mod extension;
 mod globals;

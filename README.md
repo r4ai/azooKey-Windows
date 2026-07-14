@@ -87,6 +87,15 @@ cargo make build --release
 
 標準ユーザーのセッションからUACで別の管理者資格情報を入力するインストール方法は、現在サポートしていません。AzooKeyを使用する管理者アカウント自身でインストーラーを実行してください。
 
+入力モード切替を診断するリリースログは`%LOCALAPPDATA%\Azookey\logs\client`に保存されます。通常の文字、変換前テキスト、候補は記録せず、入力モード用仮想キー、修飾キー、TSF compartmentの数値と処理結果だけを記録します。各ホストプロセスのログは最大1 MiBで、終了済みプロセスの古いログは最大64件まで保持します。直近のログは次のコマンドで確認できます。
+
+```powershell
+$log = Get-ChildItem "$env:LOCALAPPDATA\Azookey\logs\client\client-*.log" |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+Get-Content $log.FullName -Tail 200
+```
+
 インストーラーを使う方法を推奨します。開発中にDLLだけ手動登録する場合は、管理者権限のターミナルで次を実行してください。
 
 ```powershell

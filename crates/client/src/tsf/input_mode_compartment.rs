@@ -8,7 +8,10 @@ use windows::{
     },
 };
 
-use crate::engine::{composition::CompositionState, input_mode::InputMode, state::IMEState};
+use crate::{
+    diagnostics,
+    engine::{composition::CompositionState, input_mode::InputMode, state::IMEState},
+};
 
 use super::{
     factory::{TextServiceFactory, TextServiceFactory_Impl},
@@ -225,12 +228,19 @@ impl TextServiceFactory {
             // Conversion compartments are shared across the thread and can retain another
             // TIP's non-native mode. AzooKey supports Hiragana for its open state, so normalize
             // that metadata on every activation while leaving open/close under Windows control.
-            set_i4_if_changed(
+            let conversion_changed = set_i4_if_changed(
                 &compartment_mgr,
                 tid,
                 &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
                 HIRAGANA_CONVERSION_MODE,
             )?;
+            diagnostics::event(
+                "compartment_normalize",
+                format_args!(
+                    "conversion={} changed={}",
+                    HIRAGANA_CONVERSION_MODE, conversion_changed
+                ),
+            );
 
             self.sync_input_mode_from_compartments(true)?;
             Ok(())
@@ -363,14 +373,31 @@ impl TextServiceFactory {
             &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
         )?;
         let mode = input_mode_from_compartments(open_close, conversion_mode);
+        diagnostics::event(
+            "compartment_state",
+            format_args!(
+                "open_close={:?} conversion={:?} resolved={:?}",
+                open_close, conversion_mode, mode
+            ),
+        );
         self.apply_input_mode(mode, force_notification)?;
         Ok(mode)
     }
 
     pub fn set_input_mode_compartments(&self, requested_mode: InputMode) -> Result<InputMode> {
+        diagnostics::event(
+            "mode_request",
+            format_args!("requested={:?}", requested_mode),
+        );
         // Update the per-TextService authority first, and release its RefCell borrow before any
         // SetValue. SetValue can synchronously invoke OnChange on this same object.
-        self.apply_input_mode(requested_mode, false)?;
+        if let Err(error) = self.apply_input_mode(requested_mode, false) {
+            diagnostics::event(
+                "mode_result",
+                format_args!("requested={:?} status=apply_error", requested_mode),
+            );
+            return Err(error);
+        }
 
         let (compartment_mgr, tid) = self.input_mode_compartment_mgr()?;
         {
@@ -410,10 +437,35 @@ impl TextServiceFactory {
         let sync_result = self.sync_input_mode_from_compartments(false);
 
         match (write_result, sync_result) {
-            (Ok(()), Ok(mode)) => Ok(mode),
-            (Err(error), Ok(_)) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(mode)) => {
+                diagnostics::event(
+                    "mode_result",
+                    format_args!("requested={:?} actual={:?} status=ok", requested_mode, mode),
+                );
+                Ok(mode)
+            }
+            (Err(error), Ok(mode)) => {
+                diagnostics::event(
+                    "mode_result",
+                    format_args!(
+                        "requested={:?} actual={:?} status=write_error",
+                        requested_mode, mode
+                    ),
+                );
+                Err(error)
+            }
+            (Ok(()), Err(error)) => {
+                diagnostics::event(
+                    "mode_result",
+                    format_args!("requested={:?} status=sync_error", requested_mode),
+                );
+                Err(error)
+            }
             (Err(error), Err(sync_error)) => {
+                diagnostics::event(
+                    "mode_result",
+                    format_args!("requested={:?} status=write_and_sync_error", requested_mode),
+                );
                 tracing::warn!(
                     "Failed to resync input mode after compartment write error: {sync_error:?}"
                 );
@@ -430,12 +482,22 @@ impl ITfCompartmentEventSink_Impl for TextServiceFactory_Impl {
         if !is_input_mode_compartment(guid) {
             return Ok(());
         }
-
         // SetValue is synchronous and can re-enter here between the conversion and open/close
         // writes. The outbound path performs one final authoritative read after both writes.
         if self.borrow()?.compartment_write_in_progress {
             return Ok(());
         }
+        diagnostics::event(
+            "compartment_change",
+            format_args!(
+                "kind={}",
+                if *guid == GUID_COMPARTMENT_KEYBOARD_OPENCLOSE {
+                    "open_close"
+                } else {
+                    "conversion"
+                }
+            ),
+        );
 
         // Never write compartments or request a synchronous edit session from OnChange.
         // External TSF changes only update per-service state and best-effort UI here.

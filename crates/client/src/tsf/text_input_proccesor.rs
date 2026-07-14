@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
+    diagnostics,
     engine::{ipc_service, state::IMEState},
     globals::{DllModule, GUID_DISPLAY_ATTRIBUTE},
 };
@@ -261,6 +262,11 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     #[tracing::instrument]
     fn Activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
+        diagnostics::initialize();
+        diagnostics::event(
+            "activate_start",
+            format_args!("tid={} thread_manager_present={}", tid, ptim.is_some()),
+        );
         tracing::debug!("Activated with tid: {tid}");
 
         // IPC startup is best-effort. The launcher, server, and host process can race during
@@ -332,9 +338,14 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         if let Err(error) =
             unsafe { keystroke_mgr.AdviseKeyEventSink(tid, &key_event_sink, BOOL::from(true)) }
         {
+            diagnostics::event(
+                "activate_key_sink",
+                format_args!("status=error hr=0x{:08X}", error.code().0 as u32),
+            );
             self.rollback_pre_key_activation(true);
             return Err(error.into());
         }
+        diagnostics::event("activate_key_sink", format_args!("status=ok"));
 
         // English 101/102-key keyboards use Alt+` for Japanese input on/off. TSF text
         // services must preserve that command explicitly; also preserve VK_KANJI for
@@ -404,6 +415,18 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         }
 
         tracing::debug!("Activate success");
+        if let Ok(text_service) = self.borrow() {
+            diagnostics::event(
+                "activate_success",
+                format_args!(
+                    "mode={:?} preserved_mask={} open_sink={} conversion_sink={}",
+                    text_service.mode.get(),
+                    text_service.preserved_input_mode_keys,
+                    text_service.open_close_cookie.is_some(),
+                    text_service.conversion_mode_cookie.is_some()
+                ),
+            );
+        }
 
         Ok(())
     }
@@ -411,6 +434,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
     #[macros::anyhow]
     #[tracing::instrument]
     fn Deactivate(&self) -> Result<()> {
+        diagnostics::event("deactivate_start", format_args!("status=begin"));
         tracing::debug!("Deactivated");
         let mut first_error = None;
 
@@ -467,11 +491,21 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         );
 
         if let Some(error) = first_error {
+            if let Ok(text_service) = self.borrow() {
+                diagnostics::event(
+                    "deactivate_finish",
+                    format_args!(
+                        "status=retryable_error preserved_mask={} key_sink={}",
+                        text_service.preserved_input_mode_keys, text_service.key_event_sink_advised
+                    ),
+                );
+            }
             tracing::warn!(
                 "Deactivate completed with retryable TSF registrations retained: {error:?}"
             );
             Err(error)
         } else {
+            diagnostics::event("deactivate_finish", format_args!("status=ok"));
             tracing::debug!("Deactivate success");
             Ok(())
         }
