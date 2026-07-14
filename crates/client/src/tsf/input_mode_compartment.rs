@@ -39,12 +39,15 @@ fn compartment_updates(mode: InputMode) -> &'static [CompartmentUpdate] {
 
 fn input_mode_from_compartments(
     open_close: Option<i32>,
-    conversion_mode: Option<i32>,
+    _conversion_mode: Option<i32>,
 ) -> InputMode {
     let is_open = open_close.unwrap_or(0) != 0;
-    let conversion_mode = conversion_mode.unwrap_or(HIRAGANA_CONVERSION_MODE) as u32;
 
-    if is_open && conversion_mode & TF_CONVERSIONMODE_NATIVE != 0 {
+    // AzooKey exposes only an open Kana mode and a closed Latin mode. Other TIPs can leave
+    // their conversion flags (notably 0 for Microsoft IME's "A" state) in the thread-wide
+    // compartment when the user selects AzooKey. Requiring NATIVE here would immediately turn
+    // an otherwise successful open request back into Latin, so OPENCLOSE is authoritative.
+    if is_open {
         InputMode::Kana
     } else {
         InputMode::Latin
@@ -219,21 +222,15 @@ impl TextServiceFactory {
         let initialize_result = (|| -> Result<()> {
             let (compartment_mgr, tid) = self.input_mode_compartment_mgr()?;
 
-            // TSF can expose an empty conversion compartment on first activation. Seed it with
-            // the conventional Hiragana mode while leaving open/close under Windows control.
-            if read_i4(
+            // Conversion compartments are shared across the thread and can retain another
+            // TIP's non-native mode. AzooKey supports Hiragana for its open state, so normalize
+            // that metadata on every activation while leaving open/close under Windows control.
+            set_i4_if_changed(
                 &compartment_mgr,
+                tid,
                 &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
-            )?
-            .is_none()
-            {
-                set_i4_if_changed(
-                    &compartment_mgr,
-                    tid,
-                    &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
-                    HIRAGANA_CONVERSION_MODE,
-                )?;
-            }
+                HIRAGANA_CONVERSION_MODE,
+            )?;
 
             self.sync_input_mode_from_compartments(true)?;
             Ok(())
@@ -482,6 +479,10 @@ mod tests {
         );
         assert_eq!(
             input_mode_from_compartments(Some(1), Some(0)),
+            InputMode::Kana
+        );
+        assert_eq!(
+            input_mode_from_compartments(Some(0), Some(0)),
             InputMode::Latin
         );
         assert_eq!(input_mode_from_compartments(None, None), InputMode::Latin);

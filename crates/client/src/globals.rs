@@ -31,6 +31,10 @@ pub const GUID_PROFILE: GUID = GUID::from_u128(0xffdefe7a_2fc2_11ef_b16b_94e70b2
 // DisplayAttribute用のGUID
 pub const GUID_DISPLAY_ATTRIBUTE: GUID = GUID::from_u128(0xffdefe7b_2fc2_11ef_b16b_94e70b2c378c);
 
+// b5a51154-5d8d-4d6f-9c1c-feb9631a3808
+pub const GUID_PRESERVED_KEY_INPUT_MODE: GUID =
+    GUID::from_u128(0xb5a51154_5d8d_4d6f_9c1c_feb9631a3808);
+
 pub const DISPLAY_ATTRIBUTE: TF_DISPLAYATTRIBUTE = TF_DISPLAYATTRIBUTE {
     crText: TF_DA_COLOR {
         r#type: TF_CT_NONE,

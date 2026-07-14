@@ -122,6 +122,7 @@ pub struct TextService {
     pub thread_mgr: Option<ITfThreadMgr>,
     pub dll_ref_held: bool,
     pub key_event_sink_advised: bool,
+    pub preserved_input_mode_keys: u8,
     pub thread_mgr_event_cookie: Option<u32>,
     pub text_layout_context: Option<ITfContext>,
     pub text_layout_cookie: Option<u32>,

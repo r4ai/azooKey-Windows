@@ -119,6 +119,9 @@ impl TextServiceFactory {
     }
 
     fn unadvise_key_event_sink(&self) -> Result<()> {
+        if self.borrow()?.preserved_input_mode_keys != 0 {
+            anyhow::bail!("input-mode preserved keys remain registered; retaining key-event sink");
+        }
         if !self.borrow()?.key_event_sink_advised {
             return Ok(());
         }
@@ -192,6 +195,7 @@ impl TextServiceFactory {
         let has_active_composition = text_service.borrow_composition()?.tip_composition.is_some();
         Ok(has_active_composition
             || text_service.key_event_sink_advised
+            || text_service.preserved_input_mode_keys != 0
             || text_service.thread_mgr_event_cookie.is_some()
             || text_service.text_layout_cookie.is_some()
             || text_service.lang_bar_added
@@ -240,6 +244,7 @@ impl TextServiceFactory {
         text_service.text_layout_context = None;
         text_service.text_layout_cookie = None;
         text_service.key_event_sink_advised = false;
+        text_service.preserved_input_mode_keys = 0;
         text_service.lang_bar_added = false;
         text_service.open_close_cookie = None;
         text_service.conversion_mode_cookie = None;
@@ -295,6 +300,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             let mut text_service = self.borrow_mut()?;
             if text_service.dll_ref_held
                 || text_service.key_event_sink_advised
+                || text_service.preserved_input_mode_keys != 0
                 || text_service.thread_mgr_event_cookie.is_some()
                 || text_service.text_layout_cookie.is_some()
                 || text_service.lang_bar_added
@@ -328,6 +334,17 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
         {
             self.rollback_pre_key_activation(true);
             return Err(error.into());
+        }
+
+        // English 101/102-key keyboards use Alt+` for Japanese input on/off. TSF text
+        // services must preserve that command explicitly; also preserve VK_KANJI for
+        // Japanese 106/109-key keyboards and hardware remappers.
+        tracing::debug!("Preserve input-mode keys");
+        if let Err(error) = self.preserve_input_mode_keys() {
+            // Direct key-event handling remains as a fallback when another text service owns a
+            // shortcut, so do not leave the selected TIP unusable solely because preservation
+            // was rejected.
+            tracing::warn!("Failed to preserve one or more input-mode keys: {error:?}");
         }
 
         // initialize thread manager event sink
@@ -414,6 +431,11 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
             &mut first_error,
             "Unadvise thread-manager event sink",
             self.unadvise_thread_mgr_event_sink(),
+        );
+        keep_first_error(
+            &mut first_error,
+            "Unpreserve input-mode keys",
+            self.unpreserve_input_mode_keys(),
         );
         keep_first_error(
             &mut first_error,

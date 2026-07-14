@@ -74,11 +74,9 @@ impl TryFrom<usize> for UserAction {
             0x78 => UserAction::Function(Function::Nine), // VK_F9
             0x79 => UserAction::Function(Function::Ten), // VK_F10
 
-            0x16 => UserAction::SetInputMode(InputMode::Kana), // VK_IME_ON
-            0x19 => UserAction::ToggleInputMode,               // VK_KANJI
-            0x1A => UserAction::SetInputMode(InputMode::Latin), // VK_IME_OFF
-            0xF3 => UserAction::SetInputMode(InputMode::Latin), // VK_DBE_SBCSCHAR
-            0xF4 => UserAction::SetInputMode(InputMode::Kana), // VK_DBE_DBCSCHAR
+            0x15 | 0x16 | 0xF2 => UserAction::SetInputMode(InputMode::Kana), // VK_KANA / VK_IME_ON / VK_DBE_HIRAGANA
+            0x19 | 0xF3 | 0xF4 => UserAction::ToggleInputMode, // VK_KANJI / VK_DBE_SBCSCHAR / VK_DBE_DBCSCHAR
+            0x1A | 0xF0 => UserAction::SetInputMode(InputMode::Latin), // VK_IME_OFF / VK_DBE_ALPHANUMERIC
 
             _ => {
                 let key_state = {
@@ -111,14 +109,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dbcs_and_sbcs_keys_request_explicit_modes() {
+    fn dbcs_and_sbcs_keys_both_toggle_the_input_mode() {
         assert!(matches!(
             UserAction::try_from(0xF3).unwrap(),
-            UserAction::SetInputMode(InputMode::Latin)
+            UserAction::ToggleInputMode
         ));
         assert!(matches!(
             UserAction::try_from(0xF4).unwrap(),
-            UserAction::SetInputMode(InputMode::Kana)
+            UserAction::ToggleInputMode
         ));
     }
 
@@ -130,6 +128,20 @@ mod tests {
         ));
         assert!(matches!(
             UserAction::try_from(0x1A).unwrap(),
+            UserAction::SetInputMode(InputMode::Latin)
+        ));
+    }
+
+    #[test]
+    fn legacy_kana_and_dbe_keys_request_supported_modes() {
+        for key in [0x15, 0xF2] {
+            assert!(matches!(
+                UserAction::try_from(key).unwrap(),
+                UserAction::SetInputMode(InputMode::Kana)
+            ));
+        }
+        assert!(matches!(
+            UserAction::try_from(0xF0).unwrap(),
             UserAction::SetInputMode(InputMode::Latin)
         ));
     }

@@ -1,10 +1,14 @@
 use windows::{
-    core::GUID,
+    core::{Interface as _, GUID},
     Win32::{
         Foundation::{BOOL, LPARAM, WPARAM},
+        System::Ole::CONNECT_E_NOCONNECTION,
         UI::{
-            Input::KeyboardAndMouse::VK_BACK,
-            TextServices::{ITfContext, ITfKeyEventSink_Impl},
+            Input::KeyboardAndMouse::{VK_BACK, VK_CONTROL, VK_KANJI, VK_MENU, VK_OEM_3},
+            TextServices::{
+                ITfContext, ITfKeyEventSink_Impl, ITfKeystrokeMgr, TF_MOD_ALT,
+                TF_MOD_IGNORE_ALL_MODIFIER, TF_PRESERVEDKEY,
+            },
         },
     },
 };
@@ -12,9 +16,29 @@ use windows::{
 use anyhow::Result;
 use std::time::Instant;
 
-use super::factory::TextServiceFactory_Impl;
+use crate::{extension::VKeyExt as _, globals::GUID_PRESERVED_KEY_INPUT_MODE};
+
+use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
 const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
+const PRESERVED_ALT_GRAVE: u8 = 1 << 0;
+const PRESERVED_KANJI: u8 = 1 << 1;
+const INPUT_MODE_PRESERVED_KEYS: [(u8, TF_PRESERVEDKEY); 2] = [
+    (
+        PRESERVED_ALT_GRAVE,
+        TF_PRESERVEDKEY {
+            uVKey: VK_OEM_3.0 as u32,
+            uModifiers: TF_MOD_ALT,
+        },
+    ),
+    (
+        PRESERVED_KANJI,
+        TF_PRESERVEDKEY {
+            uVKey: VK_KANJI.0 as u32,
+            uModifiers: TF_MOD_IGNORE_ALL_MODIFIER,
+        },
+    ),
+];
 
 fn is_key_repeat(lparam: LPARAM) -> bool {
     lparam.0 as usize & PREVIOUS_KEY_STATE_BIT != 0
@@ -26,6 +50,143 @@ fn is_backspace(wparam: WPARAM) -> bool {
 
 fn should_claim_pending_cleanup(has_context: bool, has_pending_cleanup: bool) -> bool {
     has_context && has_pending_cleanup
+}
+
+fn is_input_mode_preserved_key(guid: &GUID) -> bool {
+    *guid == GUID_PRESERVED_KEY_INPUT_MODE
+}
+
+fn with_preserved_key(mask: u8, marker: u8, owned: bool) -> u8 {
+    if owned {
+        mask | marker
+    } else {
+        mask & !marker
+    }
+}
+
+fn should_use_direct_alt_grave(
+    wparam: WPARAM,
+    alt_pressed: bool,
+    control_pressed: bool,
+    preserved_keys: u8,
+) -> bool {
+    wparam.0 == VK_OEM_3.0 as usize
+        && alt_pressed
+        && !control_pressed
+        // Some TSF hosts surface both the ordinary key event and OnPreservedKey. Use the
+        // direct path only when this instance does not own the preserved shortcut, otherwise
+        // one press could toggle twice.
+        && preserved_keys & PRESERVED_ALT_GRAVE == 0
+}
+
+impl TextServiceFactory {
+    pub(super) fn preserve_input_mode_keys(&self) -> Result<()> {
+        let (thread_mgr, tid, registered) = {
+            let text_service = self.borrow()?;
+            (
+                text_service.thread_mgr()?,
+                text_service.tid,
+                text_service.preserved_input_mode_keys,
+            )
+        };
+        let keystroke_mgr = thread_mgr.cast::<ITfKeystrokeMgr>()?;
+        let mut first_error = None;
+
+        for (marker, key) in INPUT_MODE_PRESERVED_KEYS {
+            if registered & marker != 0 {
+                continue;
+            }
+
+            // Track ownership before calling out to COM. PreserveKey can re-enter this object;
+            // an optimistic marker prevents an untracked successful registration if storing
+            // state after the call were to fail.
+            {
+                let mut text_service = self.borrow_mut()?;
+                text_service.preserved_input_mode_keys =
+                    with_preserved_key(text_service.preserved_input_mode_keys, marker, true);
+            }
+            match unsafe {
+                keystroke_mgr.PreserveKey(tid, &GUID_PRESERVED_KEY_INPUT_MODE, &key, &[])
+            } {
+                Ok(()) => {}
+                Err(error) => {
+                    // We do not own a rejected registration and must not unpreserve another
+                    // service's key during Deactivate. If clearing fails, retain the marker
+                    // conservatively; UnpreserveKey's NOCONNECTION result is normalized below.
+                    match self.borrow_mut() {
+                        Ok(mut text_service) => {
+                            text_service.preserved_input_mode_keys = with_preserved_key(
+                                text_service.preserved_input_mode_keys,
+                                marker,
+                                false,
+                            );
+                        }
+                        Err(clear_error) => tracing::error!(
+                            "Failed to clear rejected preserved-key marker: {clear_error:?}"
+                        ),
+                    }
+                    tracing::warn!(
+                        virtual_key = key.uVKey,
+                        modifiers = key.uModifiers,
+                        "Failed to preserve input-mode key: {error:?}"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error.into());
+                    }
+                }
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn unpreserve_input_mode_keys(&self) -> Result<()> {
+        let (thread_mgr, registered) = {
+            let text_service = self.borrow()?;
+            (
+                text_service.thread_mgr()?,
+                text_service.preserved_input_mode_keys,
+            )
+        };
+        if registered == 0 {
+            return Ok(());
+        }
+
+        let keystroke_mgr = thread_mgr.cast::<ITfKeystrokeMgr>()?;
+        let mut first_error = None;
+        for (marker, key) in INPUT_MODE_PRESERVED_KEYS {
+            if registered & marker == 0 {
+                continue;
+            }
+
+            match unsafe { keystroke_mgr.UnpreserveKey(&GUID_PRESERVED_KEY_INPUT_MODE, &key) } {
+                Ok(()) => {
+                    let mut text_service = self.borrow_mut()?;
+                    text_service.preserved_input_mode_keys =
+                        with_preserved_key(text_service.preserved_input_mode_keys, marker, false);
+                }
+                Err(error) if error.code() == CONNECT_E_NOCONNECTION => {
+                    // The registration is already absent (for example, after TSF performed
+                    // external cleanup). Treat that as successful teardown.
+                    let mut text_service = self.borrow_mut()?;
+                    text_service.preserved_input_mode_keys =
+                        with_preserved_key(text_service.preserved_input_mode_keys, marker, false);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        virtual_key = key.uVKey,
+                        modifiers = key.uModifiers,
+                        "Failed to unpreserve input-mode key: {error:?}"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error.into());
+                    }
+                }
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
 }
 
 // sink (aka event listener) for key events
@@ -56,6 +217,18 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
             return Ok(true.into());
         }
 
+        let preserved_keys = self.borrow()?.preserved_input_mode_keys;
+        if pic.is_some()
+            && should_use_direct_alt_grave(
+                wparam,
+                VK_MENU.is_pressed(),
+                VK_CONTROL.is_pressed(),
+                preserved_keys,
+            )
+        {
+            return Ok(true.into());
+        }
+
         // this function checks if the key event will be handled by "OnKeyUp" function
         // so we need to return TRUE if we want to handle the key event
         let result = self.process_key(pic, wparam)?.is_some();
@@ -77,7 +250,17 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
             return Ok(true.into());
         }
 
-        let result = self.handle_key(pic, wparam)?;
+        let preserved_keys = self.borrow()?.preserved_input_mode_keys;
+        let result = if should_use_direct_alt_grave(
+            wparam,
+            VK_MENU.is_pressed(),
+            VK_CONTROL.is_pressed(),
+            preserved_keys,
+        ) {
+            self.handle_input_mode_toggle(pic)?
+        } else {
+            self.handle_key(pic, wparam)?
+        };
         if result && is_backspace(wparam) {
             self.borrow_mut()?
                 .backspace_repeat_state
@@ -107,9 +290,15 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     }
 
     #[macros::anyhow]
-    fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
-        // this function is actually not used
-        Ok(true.into())
+    fn OnPreservedKey(&self, pic: Option<&ITfContext>, rguid: *const GUID) -> Result<BOOL> {
+        let Some(guid) = (unsafe { rguid.as_ref() }) else {
+            return Ok(false.into());
+        };
+        if !is_input_mode_preserved_key(guid) {
+            return Ok(false.into());
+        }
+
+        Ok(self.handle_input_mode_toggle(pic)?.into())
     }
 
     #[macros::anyhow]
@@ -134,5 +323,51 @@ mod tests {
         assert!(should_claim_pending_cleanup(true, true));
         assert!(!should_claim_pending_cleanup(true, false));
         assert!(!should_claim_pending_cleanup(false, true));
+    }
+
+    #[test]
+    fn only_the_input_mode_command_guid_is_claimed() {
+        assert!(is_input_mode_preserved_key(&GUID_PRESERVED_KEY_INPUT_MODE));
+        assert!(!is_input_mode_preserved_key(&GUID::zeroed()));
+    }
+
+    #[test]
+    fn preserved_key_definitions_cover_101_and_japanese_keyboards() {
+        assert_eq!(INPUT_MODE_PRESERVED_KEYS[0].1.uVKey, VK_OEM_3.0 as u32);
+        assert_eq!(INPUT_MODE_PRESERVED_KEYS[0].1.uModifiers, TF_MOD_ALT);
+        assert_eq!(INPUT_MODE_PRESERVED_KEYS[1].1.uVKey, VK_KANJI.0 as u32);
+        assert_eq!(
+            INPUT_MODE_PRESERVED_KEYS[1].1.uModifiers,
+            TF_MOD_IGNORE_ALL_MODIFIER
+        );
+    }
+
+    #[test]
+    fn direct_alt_grave_is_only_a_fallback_for_an_unowned_shortcut() {
+        let grave = WPARAM(VK_OEM_3.0 as usize);
+        assert!(should_use_direct_alt_grave(grave, true, false, 0));
+        assert!(!should_use_direct_alt_grave(grave, false, false, 0));
+        assert!(!should_use_direct_alt_grave(grave, true, true, 0));
+        assert!(!should_use_direct_alt_grave(
+            grave,
+            true,
+            false,
+            PRESERVED_ALT_GRAVE
+        ));
+        assert!(!should_use_direct_alt_grave(WPARAM(0x41), true, false, 0));
+    }
+
+    #[test]
+    fn preserved_key_ownership_is_tracked_per_shortcut() {
+        let only_alt_grave = with_preserved_key(0, PRESERVED_ALT_GRAVE, true);
+        assert_eq!(only_alt_grave, PRESERVED_ALT_GRAVE);
+
+        let both = with_preserved_key(only_alt_grave, PRESERVED_KANJI, true);
+        assert_eq!(both, PRESERVED_ALT_GRAVE | PRESERVED_KANJI);
+
+        assert_eq!(
+            with_preserved_key(both, PRESERVED_ALT_GRAVE, false),
+            PRESERVED_KANJI
+        );
     }
 }

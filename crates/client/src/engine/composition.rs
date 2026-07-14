@@ -21,7 +21,7 @@ use super::{
 use windows::Win32::{
     Foundation::WPARAM,
     UI::{
-        Input::KeyboardAndMouse::VK_CONTROL,
+        Input::KeyboardAndMouse::{VK_CONTROL, VK_MENU},
         TextServices::{ITfComposition, ITfCompositionSink_Impl, ITfContext},
     },
 };
@@ -338,7 +338,7 @@ impl TextServiceFactory {
 
         // Normal shortcuts pass through, but an offline active composition above must first be
         // claimed and ended so the host cannot edit underneath stale preedit.
-        if VK_CONTROL.is_pressed() {
+        if VK_CONTROL.is_pressed() || VK_MENU.is_pressed() {
             return Ok(None);
         }
 
@@ -587,6 +587,41 @@ impl TextServiceFactory {
             ActionExecution::Applied => Ok(true),
             ActionExecution::Failed { error, disposition } => {
                 tracing::warn!("Failed to handle key action: {error:?}");
+                Ok(disposition == FailedKeyDisposition::Eat)
+            }
+        }
+    }
+
+    /// Handles a TSF input-mode command independently of the physical modifier state.
+    /// Preserved keys can be delivered after the original modifier state has changed, and the
+    /// VK_KANJI registration intentionally ignores modifiers, so routing back through
+    /// `process_key` would incorrectly reject a valid command while Ctrl happens to be down.
+    pub fn handle_input_mode_toggle(&self, context: Option<&ITfContext>) -> Result<bool> {
+        let Some(context) = context else {
+            return Ok(false);
+        };
+        self.borrow_mut()?.context = Some(context.clone());
+
+        if let Err(error) = self.finish_pending_composition_cleanup() {
+            tracing::warn!("Failed to finish pending composition cleanup: {error:?}");
+            return Ok(true);
+        }
+        if let Err(error) = self.finish_pending_input_mode_transition() {
+            tracing::warn!("Failed to finish pending input-mode transition: {error:?}");
+            return Ok(true);
+        }
+
+        let (state, mode) = {
+            let text_service = self.borrow()?;
+            let state = text_service.borrow_composition()?.state;
+            (state, text_service.mode.get())
+        };
+        let (transition, actions) = input_mode_transition(state, mode, mode.toggled());
+
+        match self.execute_actions(&actions, transition) {
+            ActionExecution::Applied => Ok(true),
+            ActionExecution::Failed { error, disposition } => {
+                tracing::warn!("Failed to handle preserved input-mode command: {error:?}");
                 Ok(disposition == FailedKeyDisposition::Eat)
             }
         }
@@ -1080,6 +1115,19 @@ mod tests {
 
         assert_eq!(state, CompositionState::Composing);
         assert_eq!(actions, [ClientAction::SetIMEMode(InputMode::Kana)]);
+    }
+
+    #[test]
+    fn input_mode_toggle_moves_both_directions() {
+        for (current, expected) in [
+            (InputMode::Latin, InputMode::Kana),
+            (InputMode::Kana, InputMode::Latin),
+        ] {
+            let (state, actions) =
+                input_mode_transition(CompositionState::None, current, current.toggled());
+            assert_eq!(state, CompositionState::None);
+            assert_eq!(actions, [ClientAction::SetIMEMode(expected)]);
+        }
     }
 
     #[test]
