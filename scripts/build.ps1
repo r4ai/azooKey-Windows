@@ -27,6 +27,17 @@ function Add-PathDirectory {
     }
 }
 
+function Set-PathDirectoryFirst {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $normalizedPath = $Path.TrimEnd('\')
+    $remainingEntries = @($env:PATH -split ';' | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and
+        $_.TrimEnd('\') -ine $normalizedPath
+    })
+    $env:PATH = (@($Path) + $remainingEntries) -join ';'
+}
+
 function Invoke-Checked {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -75,11 +86,44 @@ function Resolve-KnownFolder {
     return $path
 }
 
+function Resolve-SwiftSiblingRuntime {
+    param([Parameter(Mandatory = $true)][string]$SwiftExecutable)
+
+    $swiftBin = Split-Path $SwiftExecutable -Parent
+    $toolchainUsr = Split-Path $swiftBin -Parent
+    $toolchainRoot = Split-Path $toolchainUsr -Parent
+    $toolchainsRoot = Split-Path $toolchainRoot -Parent
+    if ((Split-Path $toolchainsRoot -Leaf) -ine "Toolchains") {
+        return $null
+    }
+
+    $versionMatch = [regex]::Match(
+        (Split-Path $toolchainRoot -Leaf),
+        '^(\d+\.\d+(?:\.\d+)?)'
+    )
+    if (-not $versionMatch.Success) {
+        return $null
+    }
+
+    $swiftInstallRoot = Split-Path $toolchainsRoot -Parent
+    $runtimeDirectory = Join-Path $swiftInstallRoot `
+        "Runtimes\$($versionMatch.Groups[1].Value)\usr\bin"
+    if (Test-Path -LiteralPath (Join-Path $runtimeDirectory "swiftCore.dll") -PathType Leaf) {
+        return $runtimeDirectory
+    }
+    return $null
+}
+
 function Resolve-SwiftExecutable {
     function Test-SwiftCandidate {
         param([Parameter(Mandatory = $true)][string]$Path)
 
+        $originalPath = $env:PATH
         try {
+            $runtimeDirectory = Resolve-SwiftSiblingRuntime -SwiftExecutable $Path
+            if (-not [string]::IsNullOrWhiteSpace($runtimeDirectory)) {
+                Set-PathDirectoryFirst -Path $runtimeDirectory
+            }
             $versionText = (& $Path --version 2>$null) -join "`n"
             return $LASTEXITCODE -eq 0 -and
                 $versionText -match 'Swift version\s+(\d+\.\d+)' -and
@@ -87,6 +131,9 @@ function Resolve-SwiftExecutable {
         }
         catch {
             return $false
+        }
+        finally {
+            $env:PATH = $originalPath
         }
     }
 
@@ -112,6 +159,99 @@ function Resolve-SwiftExecutable {
     }
 
     throw "Swift was not found. Install Swift for Windows 6.1 or newer."
+}
+
+function Get-SwiftVersion {
+    param([Parameter(Mandatory = $true)][string]$SwiftExecutable)
+
+    $versionText = (& $SwiftExecutable --version 2>$null) -join "`n"
+    $versionMatch = [regex]::Match($versionText, 'Swift version\s+(\d+\.\d+(?:\.\d+)?)')
+    if ($LASTEXITCODE -ne 0 -or -not $versionMatch.Success) {
+        throw "Could not determine the Swift version at $SwiftExecutable."
+    }
+    return $versionMatch.Groups[1].Value
+}
+
+function Test-SwiftSdkRoot {
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory = $true)][string]$SwiftVersion
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    $standardLibrary = Join-Path $Path "usr\lib\swift\windows"
+    $swiftModule = Join-Path $standardLibrary "Swift.swiftmodule"
+    if (-not (Test-Path -LiteralPath $swiftModule -PathType Container)) {
+        return $false
+    }
+
+    $settingsPath = Join-Path $Path "SDKSettings.json"
+    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+        if ([string]::IsNullOrWhiteSpace($settings.Version) -or
+            $settings.Version -ne $SwiftVersion -or
+            $null -eq $settings.SupportedTargets -or
+            $settings.SupportedTargets.PSObject.Properties.Name -notcontains "windows") {
+            return $false
+        }
+    }
+    catch {
+        return $false
+    }
+    return $true
+}
+
+function Resolve-SwiftSdkRoot {
+    param([Parameter(Mandatory = $true)][string]$SwiftExecutable)
+
+    $swiftBin = Split-Path $SwiftExecutable -Parent
+    $toolchainUsr = Split-Path $swiftBin -Parent
+    $embeddedSwiftModule = Join-Path $toolchainUsr `
+        "lib\swift\windows\Swift.swiftmodule"
+    if (Test-Path -LiteralPath $embeddedSwiftModule -PathType Container) {
+        # Swift releases with a monolithic toolchain do not require SDKROOT.
+        return $null
+    }
+
+    $swiftVersion = Get-SwiftVersion -SwiftExecutable $SwiftExecutable
+    $candidatePaths = @()
+
+    # Prefer the SDK installed beside the selected toolchain. This avoids pairing a
+    # side-by-side toolchain with a stale SDKROOT from another Swift release.
+    $toolchainRoot = Split-Path $toolchainUsr -Parent
+    $toolchainsRoot = Split-Path $toolchainRoot -Parent
+    if ((Split-Path $toolchainsRoot -Leaf) -ieq "Toolchains") {
+        $swiftInstallRoot = Split-Path $toolchainsRoot -Parent
+        $candidatePaths += Join-Path $swiftInstallRoot `
+            "Platforms\$swiftVersion\Windows.platform\Developer\SDKs\Windows.sdk"
+    }
+
+    # The official installer persists SDKROOT for future shells. Recover it when
+    # the current process predates the installation or has a sanitized environment.
+    $candidatePaths += @(
+        $env:SDKROOT,
+        [Environment]::GetEnvironmentVariable(
+            "SDKROOT",
+            [EnvironmentVariableTarget]::User
+        ),
+        [Environment]::GetEnvironmentVariable(
+            "SDKROOT",
+            [EnvironmentVariableTarget]::Machine
+        )
+    )
+
+    foreach ($candidatePath in $candidatePaths) {
+        if (Test-SwiftSdkRoot -Path $candidatePath -SwiftVersion $swiftVersion) {
+            return [IO.Path]::GetFullPath($candidatePath).TrimEnd('\')
+        }
+    }
+
+    throw "The Windows SDK containing the Swift $swiftVersion standard library was not found. Reinstall Swift for Windows or restart after its installer configures SDKROOT."
 }
 
 function Resolve-MsvcDevCmd {
@@ -172,6 +312,11 @@ $cargo = Resolve-RequiredCommand -Name "cargo.exe" -InstallHint "Install Rust wi
 $rustup = Resolve-RequiredCommand -Name "rustup.exe" -InstallHint "Install Rust with rustup."
 $null = Resolve-RequiredCommand -Name "git.exe" -InstallHint "Install Git for Windows."
 $swift = Resolve-SwiftExecutable
+$swiftRuntime = Resolve-SwiftSiblingRuntime -SwiftExecutable $swift
+if (-not [string]::IsNullOrWhiteSpace($swiftRuntime)) {
+    Set-PathDirectoryFirst -Path $swiftRuntime
+}
+$swiftSdkRoot = Resolve-SwiftSdkRoot -SwiftExecutable $swift
 $vsDevCmd = Resolve-MsvcDevCmd
 
 # Fail on a missing Rust target before downloading the larger build assets.
@@ -195,7 +340,18 @@ Invoke-Checked -FilePath $cargo -ArgumentList @("fmt", "--all", "--", "--check")
 # Asset verification uses Windows PowerShell modules that should be loaded
 # before VsDevCmd adjusts the compiler environment.
 Import-MsvcEnvironment -VsDevCmd $vsDevCmd
-Add-PathDirectory (Split-Path $swift -Parent)
+Set-PathDirectoryFirst -Path (Split-Path $swift -Parent)
+if (-not [string]::IsNullOrWhiteSpace($swiftRuntime)) {
+    Set-PathDirectoryFirst -Path $swiftRuntime
+}
+if (-not [string]::IsNullOrWhiteSpace($swiftSdkRoot)) {
+    $env:SDKROOT = $swiftSdkRoot
+}
+else {
+    # A monolithic toolchain owns its standard library. Do not let an SDKROOT
+    # left by a different side-by-side Swift release override it.
+    Remove-Item Env:SDKROOT -ErrorAction SilentlyContinue
+}
 $env:AZOOKEY_SWIFT = $swift
 
 $serverSwift = Join-Path $repoRoot "server-swift"
@@ -223,7 +379,9 @@ Invoke-Checked -FilePath $cargo `
     -ArgumentList (@("build", "-p", "azookey-windows", "--target=i686-pc-windows-msvc") + $cargoProfileArguments)
 
 $frontend = Join-Path $repoRoot "frontend"
-Invoke-Checked -FilePath $npm -ArgumentList @("ci") -WorkingDirectory $frontend
+Invoke-Checked -FilePath $npm `
+    -ArgumentList @("ci", "--include=dev") `
+    -WorkingDirectory $frontend
 $tauriArguments = @("run", "tauri", "--", "build")
 if (-not $isRelease) {
     $tauriArguments += "--debug"
