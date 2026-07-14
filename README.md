@@ -87,6 +87,10 @@ cargo make build --release
 
 標準ユーザーのセッションからUACで別の管理者資格情報を入力するインストール方法は、現在サポートしていません。AzooKeyを使用する管理者アカウント自身でインストーラーを実行してください。
 
+#### 入力モードの確認
+
+AzooKeyを選択した状態で、ANSI/101配列では`Alt`+`` ` ``、JIS配列では半角/全角キーを押すと、タスクバーの表示が`A`と`あ`の間で切り替わります。ANSI/101配列の操作は[Microsoft 日本語IMEのキー割り当て](https://learn.microsoft.com/ja-jp/globalization/input/japanese-ime)と同じです。メモ帳で`A`から`あ`へ切り替え、`nihongo`が「にほんご」になることを確認してください。
+
 入力モード切替を診断するリリースログは`%LOCALAPPDATA%\Azookey\logs\client`に保存されます。通常の文字、変換前テキスト、候補は記録せず、入力モード用仮想キー、修飾キー、TSF compartmentの数値と処理結果だけを記録します。各ホストプロセスのログは最大1 MiBで、終了済みプロセスの古いログは最大64件まで保持します。直近のログは次のコマンドで確認できます。
 
 ```powershell
