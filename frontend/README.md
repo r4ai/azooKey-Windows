@@ -13,6 +13,19 @@ npm run storybook
 
 `http://localhost:6006` で、Controls・Docs・Accessibility・Testing パネルを使えます。ツールバーからライト／ダークテーマも切り替えられます。
 
+## 変換候補 UI の開発
+
+変換候補ポップアップは設定画面とは別のネイティブ WebView UI ですが、見た目と候補更新の実装は [`../crates/ui/assets/candidate.html`](../crates/ui/assets/candidate.html) が唯一の編集元です。Rust 側はこの文書を `include_str!` で読み込むため、Storybook で見える候補一覧は本番と同じ HTML / CSS / JavaScript です。
+
+Storybook の `IME / Candidate Window` で、通常状態・長い日本語候補・多数候補のスクロール・選択状態を確認できます。候補 UI を変更したら、次を実行してください。
+
+```sh
+npm run storybook
+npm run test-storybook
+```
+
+Storybook が確認するのは WebView 文書内の候補描画です。キャレット追従、ウィンドウのサイズと画面端補正、最前面・非フォーカス表示、実 Windows の DPI／フォントはネイティブ側の責務なので、リリース前には Windows 上でも確認してください。候補文書のダークモードはブラウザ／OS の `prefers-color-scheme` に従い、Storybook のテーマツールバーとは独立しています。
+
 ## 自動チェック
 
 ```sh
