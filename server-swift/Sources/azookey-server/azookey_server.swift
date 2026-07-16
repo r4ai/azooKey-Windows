@@ -138,7 +138,7 @@ private func constructCandidateString(candidate: Candidate, hiragana: String) ->
     return result
 }
 
-func rawInputString(from pieces: [InputPiece]) -> String {
+package func rawInputString(from pieces: [InputPiece]) -> String {
     String(
         pieces.compactMap { piece -> Character? in
             switch piece {

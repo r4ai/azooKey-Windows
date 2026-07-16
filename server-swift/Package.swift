@@ -39,7 +39,10 @@ let package = Package(
         ),
         .testTarget(
             name: "azookey-serverTests",
-            dependencies: ["azookey-server"],
+            dependencies: [
+                "azookey-server",
+                .product(name: "KanaKanjiConverterModule", package: "azookeykanakanjiconverter"),
+            ],
             swiftSettings: [
                 .interoperabilityMode(.Cxx)
             ]

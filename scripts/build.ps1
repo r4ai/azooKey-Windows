@@ -360,6 +360,46 @@ Invoke-Checked -FilePath $swift -ArgumentList @("package", "resolve") -WorkingDi
 Invoke-Checked -FilePath $swift `
     -ArgumentList @("build", "-c", "release", "--disable-automatic-resolution") `
     -WorkingDirectory $serverSwift
+Add-PathDirectory -Path (Join-Path $repoRoot "llama_cpu")
+Invoke-Checked -FilePath $swift `
+    -ArgumentList @("build", "-c", "release", "--build-tests", "--disable-automatic-resolution") `
+    -WorkingDirectory $serverSwift
+$swiftTestRunner = Join-Path $serverSwift `
+    ".build\x86_64-unknown-windows-msvc\release\azookey-serverPackageTests.xctest"
+if (-not (Test-Path -LiteralPath $swiftTestRunner -PathType Leaf)) {
+    throw "Swift test build succeeded but did not produce $swiftTestRunner."
+}
+$swiftReleaseAlias = Join-Path $serverSwift ".build\release"
+$swiftReleaseDirectory = Split-Path $swiftTestRunner -Parent
+if (-not (Test-Path -LiteralPath $swiftReleaseAlias -PathType Container)) {
+    # SwiftPM normally creates this as a symbolic link, which requires either
+    # Developer Mode or elevation on Windows. A junction has the same purpose
+    # for --skip-build and works in an ordinary developer shell.
+    New-Item -ItemType Junction `
+        -Path $swiftReleaseAlias `
+        -Target $swiftReleaseDirectory | Out-Null
+}
+$swiftReleaseAliasItem = Get-Item -LiteralPath $swiftReleaseAlias -Force
+$swiftReleaseAliasTarget = @($swiftReleaseAliasItem.Target) | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($swiftReleaseAliasTarget)) {
+    throw "Swift release alias '$swiftReleaseAlias' is not a symbolic link or junction. Remove it and rebuild."
+}
+if (-not [IO.Path]::IsPathRooted($swiftReleaseAliasTarget)) {
+    $swiftReleaseAliasTarget = Join-Path `
+        (Split-Path $swiftReleaseAlias -Parent) `
+        $swiftReleaseAliasTarget
+}
+$swiftReleaseAliasTarget = [IO.Path]::GetFullPath($swiftReleaseAliasTarget).TrimEnd('\')
+$expectedSwiftReleaseTarget = [IO.Path]::GetFullPath($swiftReleaseDirectory).TrimEnd('\')
+if (-not $swiftReleaseAliasTarget.Equals(
+    $expectedSwiftReleaseTarget,
+    [StringComparison]::OrdinalIgnoreCase
+)) {
+    throw "Swift release alias '$swiftReleaseAlias' points to '$swiftReleaseAliasTarget', expected '$expectedSwiftReleaseTarget'. Remove it and rebuild."
+}
+Invoke-Checked -FilePath $swift `
+    -ArgumentList @("test", "-c", "release", "--skip-build", "--disable-automatic-resolution") `
+    -WorkingDirectory $serverSwift
 $swiftLibrary = Join-Path $serverSwift ".build\x86_64-unknown-windows-msvc\release\azookey-server.lib"
 if (-not (Test-Path -LiteralPath $swiftLibrary -PathType Leaf)) {
     throw "Swift build succeeded but did not produce $swiftLibrary."

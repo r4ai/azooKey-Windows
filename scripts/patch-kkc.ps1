@@ -13,6 +13,7 @@ $patchedFile = "Sources/KanaKanjiConverterModule/ConversionAlgorithms/Zenzai/Zen
 $expectedOriginalBlob = "d268f9a2a46281600425a1fce081c062678b2acb"
 $expectedPatchedBlob = "34bc2c986f35f95db8f65e913595dd255a79581f"
 $expectedPatchedStatus = " M $patchedFile"
+$converterDictionaryPath = "Sources/KanaKanjiConverterModuleWithDefaultDictionary/azooKey_dictionary_storage"
 $packageRoot = (Resolve-Path -LiteralPath $PackagePath).Path
 $resolvedPath = Join-Path $packageRoot "Package.resolved"
 $patchPath = Join-Path $PSScriptRoot "patches\AzooKeyKanaKanjiConverter-v0.11.2-inference.patch"
@@ -56,6 +57,39 @@ if ($LASTEXITCODE -ne 0) {
 }
 if ($head -ne $expectedRevision) {
     throw "Refusing to patch unexpected AzooKeyKanaKanjiConverter revision '$head'; expected '$expectedRevision'."
+}
+
+# The converter and its binary dictionary are versioned together.  Inspect the
+# dictionary gitlink recorded by the resolved converter instead of duplicating
+# that revision here, so a future converter update cannot silently package an
+# incompatible top-level dictionary.
+$expectedDictionaryRevision = (& git -c $gitSafeDirectory -C $checkoutRoot `
+    rev-parse "HEAD:$converterDictionaryPath" 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not determine the dictionary revision required by AzooKeyKanaKanjiConverter: $expectedDictionaryRevision"
+}
+
+$dictionaryPath = Join-Path $packageRoot "azooKey_dictionary_storage"
+if (-not (Test-Path -LiteralPath $dictionaryPath -PathType Container)) {
+    throw "The AzooKey dictionary submodule was not found at '$dictionaryPath'. Initialize submodules recursively."
+}
+$dictionaryRoot = (Resolve-Path -LiteralPath $dictionaryPath).Path
+$dictionaryGitSafeDirectory = "safe.directory=$($dictionaryRoot -replace '\\', '/')"
+$actualDictionaryRevision = (& git -c $dictionaryGitSafeDirectory -C $dictionaryRoot `
+    rev-parse HEAD 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not inspect the AzooKey dictionary submodule: $actualDictionaryRevision"
+}
+$dictionaryStatus = @(& git -c $dictionaryGitSafeDirectory -C $dictionaryRoot `
+    status --porcelain=v1 --untracked-files=all)
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not inspect the AzooKey dictionary working tree."
+}
+if ($dictionaryStatus.Count -ne 0) {
+    throw "The AzooKey dictionary submodule contains local changes. Refusing to package unversioned dictionary data."
+}
+if ($actualDictionaryRevision -ne $expectedDictionaryRevision) {
+    throw "AzooKeyKanaKanjiConverter v$expectedVersion requires dictionary revision '$expectedDictionaryRevision', but the application dictionary is '$actualDictionaryRevision'. Update server-swift/azooKey_dictionary_storage to the converter's recorded revision."
 }
 
 function Test-GitPatch([bool]$Reverse) {
