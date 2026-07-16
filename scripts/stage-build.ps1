@@ -120,15 +120,24 @@ try {
     }
 
     if ([IO.Directory]::Exists($buildDir)) {
-        Move-Item -LiteralPath $buildDir -Destination $backupDir
+        # Move-Item can move a directory's children one at a time on Windows. If one
+        # child (typically a running installer) is locked, that leaves both the build
+        # and backup directories partially populated. Directory.Move performs one
+        # same-volume rename, so failure preserves the complete previous build.
+        try {
+            [IO.Directory]::Move($buildDir, $backupDir)
+        }
+        catch {
+            throw "Could not preserve the previous build. Close any running azookey-setup.exe and retry. $($_.Exception.Message)"
+        }
     }
     try {
-        Move-Item -LiteralPath $stagingDir -Destination $buildDir
+        [IO.Directory]::Move($stagingDir, $buildDir)
     }
     catch {
         if (-not (Test-Path -LiteralPath $buildDir) -and
             (Test-Path -LiteralPath $backupDir -PathType Container)) {
-            Move-Item -LiteralPath $backupDir -Destination $buildDir
+            [IO.Directory]::Move($backupDir, $buildDir)
         }
         throw
     }

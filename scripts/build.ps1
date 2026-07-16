@@ -445,7 +445,7 @@ catch {
     }
     if (-not [string]::IsNullOrWhiteSpace($previousBuild)) {
         $previousBuild = Assert-PreviousBuildPath -Path $previousBuild
-        Move-Item -LiteralPath $previousBuild -Destination $buildDirectory
+        [IO.Directory]::Move($previousBuild, $buildDirectory)
     }
     throw $packagingError
 }
