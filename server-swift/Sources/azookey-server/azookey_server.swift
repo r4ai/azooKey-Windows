@@ -319,12 +319,13 @@ public func appendText(
 
 @_cdecl("RemoveText")
 public func removeText(
+    count: Int32,
     cursorPointer: UnsafeMutablePointer<Int32>?
 ) -> UnsafeMutablePointer<CChar>? {
-    guard converter != nil, let cursorPointer else {
+    guard converter != nil, count > 0, let cursorPointer else {
         return nil
     }
-    composingText.deleteBackwardFromCursorPosition(count: 1)
+    composingText.deleteBackwardFromCursorPosition(count: Int(count))
     return copyCurrentComposingText(cursorPointer: cursorPointer)
 }
 

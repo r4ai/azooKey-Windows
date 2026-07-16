@@ -871,8 +871,10 @@ impl IPCService {
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn remove_text(&mut self) -> Result<Candidates> {
-        let request = self.stateful_request(shared::proto::RemoveTextRequest {})?;
+    pub fn remove_text(&mut self, count: u32) -> Result<Candidates> {
+        let request = self.stateful_request(shared::proto::RemoveTextRequest {
+            count: count.max(1),
+        })?;
         self.with_server_rpc(false, |runtime, client| {
             let response = runtime.block_on(client.remove_text(request))?;
             Candidates::from_composing_text(response.into_inner().composing_text)

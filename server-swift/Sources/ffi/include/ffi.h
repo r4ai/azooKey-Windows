@@ -30,7 +30,7 @@ int32_t LoadConfig(void);
 int32_t SetContext(const char *context);
 
 char *AppendText(const char *input, int32_t *cursor);
-char *RemoveText(int32_t *cursor);
+char *RemoveText(int32_t count, int32_t *cursor);
 char *MoveCursor(int32_t offset, int32_t *cursor);
 char *ShrinkText(int32_t offset);
 char *CommitPrefixAndAppend(int32_t offset, const char *input, int32_t *cursor);

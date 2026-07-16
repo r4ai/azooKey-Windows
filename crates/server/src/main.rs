@@ -115,7 +115,7 @@ unsafe extern "C" {
     fn Initialize(path: *const c_char, use_zenzai: i32) -> i32;
     fn SetContext(context: *const c_char) -> i32;
     fn AppendText(input: *const c_char, cursor: *mut i32) -> *mut c_char;
-    fn RemoveText(cursor: *mut i32) -> *mut c_char;
+    fn RemoveText(count: i32, cursor: *mut i32) -> *mut c_char;
     fn MoveCursor(offset: i32, cursor: *mut i32) -> *mut c_char;
     fn ShrinkText(offset: i32) -> *mut c_char;
     fn CommitPrefixAndAppend(offset: i32, input: *const c_char, cursor: *mut i32) -> *mut c_char;
@@ -209,10 +209,14 @@ fn move_cursor(offset: i32) -> Result<RawComposingText, FfiError> {
     })
 }
 
-fn remove_text() -> Result<RawComposingText, FfiError> {
+fn normalized_remove_count(count: u32) -> i32 {
+    count.max(1).min(i32::MAX as u32) as i32
+}
+
+fn remove_text(count: i32) -> Result<RawComposingText, FfiError> {
     let mut cursor = 0;
-    // SAFETY: cursor is a valid output pointer.
-    let result = unsafe { RemoveText(&mut cursor) };
+    // SAFETY: count is positive and cursor is a valid output pointer.
+    let result = unsafe { RemoveText(count, &mut cursor) };
     Ok(RawComposingText {
         text: copy_owned_string(result, "RemoveText")?,
     })
@@ -527,13 +531,18 @@ impl AzookeyService for MyAzookeyService {
         request: Request<RemoveTextRequest>,
     ) -> Result<Response<RemoveTextResponse>, Status> {
         let token = ipc_session_token(&request)?;
+        let count = normalized_remove_count(request.get_ref().count);
         let mut ffi_state = self.lock_ffi().await;
         match ffi_state.owner_access(&token) {
             OwnerAccess::Owned => {}
             OwnerAccess::ClaimedLegacy => clear_text(),
             OwnerAccess::Rejected => return Err(non_owner_status("RemoveText")),
         }
-        let composing_text = remove_text().and_then(convert).map_err(ffi_error_status)?;
+        // ComposingText supports a counted surface deletion. Mutate once and regenerate
+        // candidates once, regardless of how many auto-repeat events the client batched.
+        let composing_text = remove_text(count)
+            .and_then(convert)
+            .map_err(ffi_error_status)?;
 
         Ok(Response::new(RemoveTextResponse {
             composing_text: Some(composing_text),
@@ -741,6 +750,14 @@ mod tests {
         };
         assert!(composing_text.suggestions.is_empty());
         assert_eq!(composing_text.raw_input, "kyo");
+    }
+
+    #[test]
+    fn remove_count_is_backward_compatible_and_bounded_for_ffi() {
+        assert_eq!(normalized_remove_count(0), 1);
+        assert_eq!(normalized_remove_count(1), 1);
+        assert_eq!(normalized_remove_count(37), 37);
+        assert_eq!(normalized_remove_count(u32::MAX), i32::MAX);
     }
 
     #[test]

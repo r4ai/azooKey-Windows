@@ -232,6 +232,7 @@ impl TextServiceFactory {
         text_service.pending_input_mode_transition.set(None);
         text_service.pending_composition_cleanup.set(false);
         text_service.compartment_write_in_progress = false;
+        text_service.backspace_repeat_state.reset();
         text_service.borrow_mut_composition()?.reset();
         Ok(())
     }

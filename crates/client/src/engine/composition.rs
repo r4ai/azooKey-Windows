@@ -37,8 +37,16 @@ pub enum CompositionState {
     Selecting,
 }
 
-fn is_last_composing_character(text: &str) -> bool {
-    text.chars().nth(1).is_none()
+fn backspace_removes_entire_composition(text: &str, count: u32) -> bool {
+    usize::try_from(count.max(1)).map_or(true, |count| count >= text.chars().count())
+}
+
+fn should_pass_through_shortcut(
+    control_pressed: bool,
+    alt_pressed: bool,
+    replaying_claimed_backspace: bool,
+) -> bool {
+    !replaying_claimed_backspace && (control_pressed || alt_pressed)
 }
 
 fn text_with_type(set_type: &SetTextType, raw_input: &str, raw_hiragana: &str) -> String {
@@ -102,6 +110,19 @@ enum ActionExecution {
         error: anyhow::Error,
         disposition: FailedKeyDisposition,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyHandlingOutcome {
+    NotHandled,
+    Consumed,
+    Retry,
+}
+
+impl KeyHandlingOutcome {
+    pub(crate) fn is_eaten(self) -> bool {
+        self != Self::NotHandled
+    }
 }
 
 fn failed_key_disposition(
@@ -180,9 +201,13 @@ impl TextServiceFactory {
             composition.reset();
         }
         {
-            let text_service = self.borrow()?;
+            let mut text_service = self.borrow_mut()?;
             text_service.pending_input_mode_transition.set(None);
             text_service.pending_composition_cleanup.set(false);
+            // Retained repeats belong only to the composition that just ended. Preserve the
+            // short timing guard so already-queued repeats are still eaten instead of reaching
+            // committed host text, but never carry their deletion count into a new composition.
+            text_service.backspace_repeat_state.clear_pending();
         }
 
         let ipc_service = IMEState::ipc_snapshot();
@@ -295,19 +320,21 @@ impl TextServiceFactory {
         &self,
         context: Option<&ITfContext>,
         wparam: WPARAM,
+        backspace_count: u32,
+        replaying_claimed_backspace: bool,
     ) -> Result<Option<(Vec<ClientAction>, CompositionState)>> {
         if context.is_none() {
             return Ok(None);
         };
 
-        let (composition_state, tip_exists, is_last_input, suffix_is_empty, mode) = {
+        let (composition_state, tip_exists, remove_entire_input, suffix_is_empty, mode) = {
             let text_service = self.borrow()?;
             let composition = text_service.borrow_composition()?;
             let mode = text_service.mode.get();
             (
                 composition.state,
                 composition.tip_composition.is_some(),
-                is_last_composing_character(&composition.raw_hiragana),
+                backspace_removes_entire_composition(&composition.raw_hiragana, backspace_count),
                 composition.suffix.is_empty(),
                 mode,
             )
@@ -338,7 +365,11 @@ impl TextServiceFactory {
 
         // Normal shortcuts pass through, but an offline active composition above must first be
         // claimed and ended so the host cannot edit underneath stale preedit.
-        if VK_CONTROL.is_pressed() || VK_MENU.is_pressed() {
+        if should_pass_through_shortcut(
+            VK_CONTROL.is_pressed(),
+            VK_MENU.is_pressed(),
+            replaying_claimed_backspace,
+        ) {
             return Ok(None);
         }
 
@@ -386,13 +417,16 @@ impl TextServiceFactory {
                     vec![ClientAction::AppendText(number.to_string())],
                 ),
                 UserAction::Backspace => {
-                    if is_last_input {
+                    if remove_entire_input {
                         (
                             CompositionState::None,
                             vec![ClientAction::DiscardComposition],
                         )
                     } else {
-                        (CompositionState::Composing, vec![ClientAction::RemoveText])
+                        (
+                            CompositionState::Composing,
+                            vec![ClientAction::RemoveText(backspace_count.max(1))],
+                        )
                     }
                 }
                 UserAction::Enter => {
@@ -467,13 +501,16 @@ impl TextServiceFactory {
                     vec![ClientAction::CommitPrefixAndAppend(number.to_string())],
                 ),
                 UserAction::Backspace => {
-                    if is_last_input {
+                    if remove_entire_input {
                         (
                             CompositionState::None,
                             vec![ClientAction::DiscardComposition],
                         )
                     } else {
-                        (CompositionState::Composing, vec![ClientAction::RemoveText])
+                        (
+                            CompositionState::Composing,
+                            vec![ClientAction::RemoveText(backspace_count.max(1))],
+                        )
                     }
                 }
                 UserAction::Enter => {
@@ -547,25 +584,31 @@ impl TextServiceFactory {
     }
 
     #[tracing::instrument]
-    pub fn handle_key(&self, context: Option<&ITfContext>, wparam: WPARAM) -> Result<bool> {
+    pub fn handle_key(
+        &self,
+        context: Option<&ITfContext>,
+        wparam: WPARAM,
+        backspace_count: u32,
+        replaying_claimed_backspace: bool,
+    ) -> Result<KeyHandlingOutcome> {
         if let Some(context) = context {
             self.borrow_mut()?.context = Some(context.clone());
         } else {
-            return Ok(false);
+            return Ok(KeyHandlingOutcome::NotHandled);
         };
 
         if let Err(error) = self.finish_pending_composition_cleanup() {
             // The previous failure may have left a live TSF range. Keep claiming keys until it
             // can be ended; passing this key to the host could edit underneath that range.
             tracing::warn!("Failed to finish pending composition cleanup: {error:?}");
-            return Ok(true);
+            return Ok(KeyHandlingOutcome::Retry);
         }
 
         if let Err(error) = self.finish_pending_input_mode_transition() {
             // Keep the pending transition for the next key. Passing this key to the host while
             // the old TIP composition is still active would mix host input with stale preedit.
             tracing::warn!("Failed to finish pending input-mode transition: {error:?}");
-            return Ok(true);
+            return Ok(KeyHandlingOutcome::Retry);
         }
 
         // A reconnect creates a fresh UI channel whose deduplication cache is empty. Synchronize
@@ -579,15 +622,27 @@ impl TextServiceFactory {
             }
         }
 
-        let Some((actions, transition)) = self.process_key(context, wparam)? else {
-            return Ok(false);
+        let Some((actions, transition)) = self.process_key(
+            context,
+            wparam,
+            backspace_count,
+            replaying_claimed_backspace,
+        )?
+        else {
+            return Ok(KeyHandlingOutcome::NotHandled);
         };
 
         match self.execute_actions(&actions, transition) {
-            ActionExecution::Applied => Ok(true),
+            ActionExecution::Applied => Ok(KeyHandlingOutcome::Consumed),
             ActionExecution::Failed { error, disposition } => {
                 tracing::warn!("Failed to handle key action: {error:?}");
-                Ok(disposition == FailedKeyDisposition::Eat)
+                Ok(if disposition == FailedKeyDisposition::Eat {
+                    // An observable effect may already have occurred, so replaying this input
+                    // could over-delete even though later cleanup failed.
+                    KeyHandlingOutcome::Consumed
+                } else {
+                    KeyHandlingOutcome::NotHandled
+                })
             }
         }
     }
@@ -810,8 +865,8 @@ impl TextServiceFactory {
                     require_ipc_service!()
                         .set_candidate_state(&candidates.texts, selection_index)?;
                 }
-                ClientAction::RemoveText => {
-                    candidates = Arc::new(require_ipc_service!().remove_text()?);
+                ClientAction::RemoveText(count) => {
+                    candidates = Arc::new(require_ipc_service!().remove_text(*count)?);
                     selection_index = 0;
                     let text = candidates.texts.first().map(String::as_str).unwrap_or("");
                     let sub_text = candidates
@@ -1007,19 +1062,29 @@ impl TextServiceFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_display_text, displayed_utf16_count, failed_key_disposition,
-        input_mode_transition, is_last_composing_character, snapshot_is_current, text_with_type,
-        ActionProgress, ClientAction, Composition, CompositionState, FailedKeyDisposition,
-        InputMode, SetTextType,
+        backspace_removes_entire_composition, candidate_display_text, displayed_utf16_count,
+        failed_key_disposition, input_mode_transition, should_pass_through_shortcut,
+        snapshot_is_current, text_with_type, ActionProgress, ClientAction, Composition,
+        CompositionState, FailedKeyDisposition, InputMode, SetTextType,
     };
     use std::sync::Arc;
 
     #[test]
-    fn last_input_check_handles_multibyte_characters() {
-        assert!(is_last_composing_character(""));
-        assert!(is_last_composing_character("あ"));
-        assert!(!is_last_composing_character("あい"));
-        assert!(!is_last_composing_character("ab"));
+    fn batched_backspace_detects_when_no_conversion_is_needed() {
+        assert!(backspace_removes_entire_composition("", 1));
+        assert!(backspace_removes_entire_composition("あ", 1));
+        assert!(!backspace_removes_entire_composition("あい", 1));
+        assert!(backspace_removes_entire_composition("あい", 2));
+        assert!(!backspace_removes_entire_composition("abc", 2));
+        assert!(backspace_removes_entire_composition("abc", 3));
+    }
+
+    #[test]
+    fn claimed_backspace_replay_ignores_later_modifier_state() {
+        assert!(should_pass_through_shortcut(true, false, false));
+        assert!(should_pass_through_shortcut(false, true, false));
+        assert!(!should_pass_through_shortcut(true, false, true));
+        assert!(!should_pass_through_shortcut(false, true, true));
     }
 
     #[test]

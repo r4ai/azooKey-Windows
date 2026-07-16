@@ -17,19 +17,47 @@ const BACKSPACE_REPEAT_COALESCE_WINDOW: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Default)]
 pub struct BackspaceRepeatState {
-    last_handled_at: Option<Instant>,
+    last_batch_started_at: Option<Instant>,
+    pending_count: u32,
 }
 
 impl BackspaceRepeatState {
-    pub fn should_suppress(&self, is_repeat: bool, now: Instant) -> bool {
+    /// Returns whether this repeat should be retained for the next batch instead of running a
+    /// conversion immediately. The window is measured from the start of the previous batch, so
+    /// synchronous conversion latency does not add another artificial pause.
+    pub fn should_defer(&self, is_repeat: bool, now: Instant) -> bool {
         is_repeat
-            && self.last_handled_at.is_some_and(|last| {
+            && self.last_batch_started_at.is_some_and(|last| {
                 now.saturating_duration_since(last) < BACKSPACE_REPEAT_COALESCE_WINDOW
             })
     }
 
-    pub fn mark_handled(&mut self, now: Instant) {
-        self.last_handled_at = Some(now);
+    pub fn defer(&mut self, count: u32) {
+        self.pending_count = self.pending_count.saturating_add(count.max(1));
+    }
+
+    pub fn batch_count(&self, current_count: u32) -> u32 {
+        self.pending_count.saturating_add(current_count.max(1))
+    }
+
+    pub fn take_pending(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_count)
+    }
+
+    pub fn clear_pending(&mut self) {
+        self.pending_count = 0;
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn pending_count(&self) -> u32 {
+        self.pending_count
+    }
+
+    pub fn mark_batch_started(&mut self, now: Instant) {
+        self.last_batch_started_at = Some(now);
     }
 }
 
@@ -173,14 +201,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backspace_repeat_state_only_coalesces_fast_repeats() {
+    fn backspace_repeat_state_preserves_deferred_deletions() {
         let start = Instant::now();
         let mut state = BackspaceRepeatState::default();
-        state.mark_handled(start);
+        state.mark_batch_started(start);
 
-        assert!(!state.should_suppress(false, start + Duration::from_millis(1)));
-        assert!(state.should_suppress(true, start + Duration::from_millis(79)));
-        assert!(!state.should_suppress(true, start + Duration::from_millis(80)));
+        assert!(!state.should_defer(false, start + Duration::from_millis(1)));
+        assert!(state.should_defer(true, start + Duration::from_millis(79)));
+        state.defer(2);
+        state.defer(3);
+        assert_eq!(state.pending_count(), 5);
+        assert_eq!(state.batch_count(1), 6);
+        state.clear_pending();
+        assert_eq!(state.pending_count(), 0);
+        assert!(!state.should_defer(true, start + Duration::from_millis(80)));
+    }
+
+    #[test]
+    fn backspace_repeat_count_saturates_instead_of_wrapping() {
+        let mut state = BackspaceRepeatState::default();
+        state.defer(u32::MAX);
+        state.defer(1);
+
+        assert_eq!(state.take_pending(), u32::MAX);
+    }
+
+    #[test]
+    fn terminated_composition_does_not_leak_deletions_into_the_next_one() {
+        let start = Instant::now();
+        let mut state = BackspaceRepeatState::default();
+        state.mark_batch_started(start);
+        state.defer(4);
+
+        state.clear_pending();
+
+        assert_eq!(state.batch_count(1), 1);
+        // Keep the short safety window so queued repeats cannot reach committed host text.
+        assert!(state.should_defer(true, start + Duration::from_millis(1)));
+
+        state.reset();
+        assert!(!state.should_defer(true, start + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn thirty_hertz_repeat_sequence_keeps_every_deletion_while_batching_conversions() {
+        let start = Instant::now();
+        let mut state = BackspaceRepeatState::default();
+        let mut processed_count = 0;
+        let mut conversion_count = 0;
+
+        for index in 0..30 {
+            let now = start + Duration::from_millis(index * 33);
+            let is_repeat = index != 0;
+            if state.should_defer(is_repeat, now) {
+                state.defer(1);
+            } else {
+                processed_count += state.batch_count(1);
+                state.clear_pending();
+                conversion_count += 1;
+                state.mark_batch_started(now);
+            }
+        }
+        processed_count += state.take_pending();
+
+        assert_eq!(processed_count, 30);
+        assert!(conversion_count < 15);
     }
 
     #[test]

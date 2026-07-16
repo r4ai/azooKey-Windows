@@ -10,6 +10,7 @@ struct AzookeyServerTests {
         #expect(initialize(path: nil, useZenzai: 1) == 1)
         #expect(setContext(context: nil) == 1)
         #expect(appendText(input: nil, cursorPointer: nil) == nil)
+        #expect(removeText(count: 1, cursorPointer: nil) == nil)
         #expect(getComposedText(lengthPointer: nil) == nil)
         #expect(getRawInput() == nil)
     }
@@ -32,6 +33,17 @@ struct AzookeyServerTests {
                 ]
             ) == "ka"
         )
+    }
+
+    @Test
+    func composingTextDeletesMultipleSurfaceCharactersAtOnce() {
+        var text = ComposingText()
+        text.insertAtCursorPosition("kansha", inputStyle: .roman2kana)
+        #expect(text.convertTarget == "かんしゃ")
+
+        text.deleteBackwardFromCursorPosition(count: 2)
+
+        #expect(text.convertTarget == "かん")
     }
 
     @Test

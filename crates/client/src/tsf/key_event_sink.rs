@@ -4,7 +4,7 @@ use windows::{
         Foundation::{BOOL, LPARAM, WPARAM},
         System::Ole::CONNECT_E_NOCONNECTION,
         UI::{
-            Input::KeyboardAndMouse::{VK_BACK, VK_CONTROL, VK_KANJI, VK_OEM_3, VK_SHIFT},
+            Input::KeyboardAndMouse::{VK_BACK, VK_CONTROL, VK_KANJI, VK_MENU, VK_OEM_3, VK_SHIFT},
             TextServices::{
                 ITfContext, ITfKeyEventSink_Impl, ITfKeystrokeMgr, TF_MOD_ALT,
                 TF_MOD_IGNORE_ALL_MODIFIER, TF_PRESERVEDKEY,
@@ -16,11 +16,15 @@ use windows::{
 use anyhow::Result;
 use std::time::Instant;
 
-use crate::{diagnostics, extension::VKeyExt as _, globals::GUID_PRESERVED_KEY_INPUT_MODE};
+use crate::{
+    diagnostics, engine::composition::KeyHandlingOutcome, extension::VKeyExt as _,
+    globals::GUID_PRESERVED_KEY_INPUT_MODE,
+};
 
 use super::factory::{TextServiceFactory, TextServiceFactory_Impl};
 
 const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
+const REPEAT_COUNT_MASK: usize = 0xFFFF;
 const ALT_CONTEXT_BIT: usize = 1 << 29;
 const PRESERVED_ALT_GRAVE: u8 = 1 << 0;
 const PRESERVED_KANJI: u8 = 1 << 1;
@@ -45,6 +49,10 @@ fn is_key_repeat(lparam: LPARAM) -> bool {
     lparam.0 as usize & PREVIOUS_KEY_STATE_BIT != 0
 }
 
+fn key_repeat_count(lparam: LPARAM) -> u32 {
+    ((lparam.0 as usize & REPEAT_COUNT_MASK) as u32).max(1)
+}
+
 fn has_alt_context(lparam: LPARAM) -> bool {
     lparam.0 as usize & ALT_CONTEXT_BIT != 0
 }
@@ -55,6 +63,18 @@ fn is_backspace(wparam: WPARAM) -> bool {
 
 fn should_claim_pending_cleanup(has_context: bool, has_pending_cleanup: bool) -> bool {
     has_context && has_pending_cleanup
+}
+
+fn should_claim_key_to_flush_backspaces(
+    has_context: bool,
+    can_merge_current_backspace: bool,
+    pending_count: u32,
+) -> bool {
+    has_context && !can_merge_current_backspace && pending_count != 0
+}
+
+fn shortcut_modifier_is_pressed() -> bool {
+    VK_CONTROL.is_pressed() || VK_MENU.is_pressed()
 }
 
 fn is_input_mode_preserved_key(guid: &GUID) -> bool {
@@ -124,6 +144,54 @@ fn log_mode_key_event(
 }
 
 impl TextServiceFactory {
+    fn resolve_backspace_batch(
+        &self,
+        outcome: KeyHandlingOutcome,
+        batch_started_at: Instant,
+        retry_current_count: u32,
+    ) -> Result<()> {
+        let mut text_service = self.borrow_mut()?;
+        match outcome {
+            KeyHandlingOutcome::Consumed => {
+                text_service.backspace_repeat_state.clear_pending();
+                text_service
+                    .backspace_repeat_state
+                    .mark_batch_started(batch_started_at);
+            }
+            KeyHandlingOutcome::NotHandled => {
+                text_service.backspace_repeat_state.clear_pending();
+            }
+            KeyHandlingOutcome::Retry if retry_current_count != 0 => {
+                text_service
+                    .backspace_repeat_state
+                    .defer(retry_current_count);
+            }
+            KeyHandlingOutcome::Retry => {}
+        }
+        Ok(())
+    }
+
+    /// Returns false when recovery must finish before a later key can be processed.
+    fn flush_pending_backspaces(&self, context: Option<&ITfContext>) -> Result<bool> {
+        let count = self.borrow()?.backspace_repeat_state.pending_count();
+        if count == 0 {
+            return Ok(true);
+        }
+
+        // Preserve event order when another key is pressed before Backspace is released. Without
+        // this flush, the retained deletes would run after the newer key and could delete it.
+        let batch_started_at = Instant::now();
+        let outcome = self.handle_key(context, WPARAM(VK_BACK.0 as usize), count, true)?;
+        self.resolve_backspace_batch(outcome, batch_started_at, 0)?;
+        tracing::debug!(
+            count,
+            ?outcome,
+            elapsed_us = u64::try_from(batch_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "Flushed Backspace conversion batch before a later key"
+        );
+        Ok(outcome != KeyHandlingOutcome::Retry)
+    }
+
     pub(super) fn preserve_input_mode_keys(&self) -> Result<()> {
         let (thread_mgr, tid) = {
             let text_service = self.borrow()?;
@@ -276,15 +344,26 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
-        if is_backspace(wparam)
+        let backspace = is_backspace(wparam);
+        let can_merge_current_backspace = backspace && !shortcut_modifier_is_pressed();
+        if can_merge_current_backspace
             && self
                 .borrow()?
                 .backspace_repeat_state
-                .should_suppress(is_key_repeat(lparam), Instant::now())
+                .should_defer(is_key_repeat(lparam), Instant::now())
         {
-            // Claim queued auto-repeat events even if the previous event ended the
-            // composition. Otherwise the host application can receive the backlog and
-            // unexpectedly delete committed text.
+            // OnKeyDown retains this event for the next conversion batch while a composition is
+            // active. If the previous batch ended the composition, continue claiming only this
+            // short backlog window so it cannot unexpectedly delete committed host text.
+            return Ok(true.into());
+        }
+
+        if should_claim_key_to_flush_backspaces(
+            pic.is_some(),
+            can_merge_current_backspace,
+            self.borrow()?.backspace_repeat_state.pending_count(),
+        ) {
+            // Ensure OnKeyDown runs so retained deletes are applied before this newer key.
             return Ok(true.into());
         }
 
@@ -328,7 +407,7 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
 
         // this function checks if the key event will be handled by "OnKeyUp" function
         // so we need to return TRUE if we want to handle the key event
-        let result = self.process_key(pic, wparam)?.is_some();
+        let result = self.process_key(pic, wparam, 1, false)?.is_some();
         log_mode_key_event(
             "test_down",
             "key_sink",
@@ -346,14 +425,47 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
         // this function is called when a key is pressed
         // we can handle key events here
-        if is_backspace(wparam)
+        let backspace = is_backspace(wparam);
+        let repeat = is_key_repeat(lparam);
+        let can_merge_current_backspace = backspace && !shortcut_modifier_is_pressed();
+        let batch_started_at = Instant::now();
+        if can_merge_current_backspace
             && self
                 .borrow()?
                 .backspace_repeat_state
-                .should_suppress(is_key_repeat(lparam), Instant::now())
+                .should_defer(repeat, batch_started_at)
         {
+            let composition_is_active = {
+                let text_service = self.borrow()?;
+                let active = text_service.borrow_composition()?.tip_composition.is_some();
+                active
+            };
+            if composition_is_active {
+                self.borrow_mut()?
+                    .backspace_repeat_state
+                    .defer(key_repeat_count(lparam));
+            }
             return Ok(true.into());
         }
+
+        if !can_merge_current_backspace && !self.flush_pending_backspaces(pic)? {
+            // The retained Backspace batch could not yet pass recovery. This key was claimed in
+            // OnTestKeyDown and must wait rather than overtaking those deletions.
+            return Ok(true.into());
+        }
+
+        let current_backspace_count = if backspace {
+            key_repeat_count(lparam)
+        } else {
+            1
+        };
+        let backspace_count = if can_merge_current_backspace {
+            self.borrow()?
+                .backspace_repeat_state
+                .batch_count(current_backspace_count)
+        } else {
+            1
+        };
 
         let preserved_keys = self.borrow()?.preserved_input_mode_keys;
         let alt_pressed = has_alt_context(lparam);
@@ -377,7 +489,18 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         let result = if direct_alt_grave {
             self.handle_input_mode_toggle(pic)?
         } else {
-            self.handle_key(pic, wparam)?
+            let outcome = self.handle_key(pic, wparam, backspace_count, false)?;
+            if can_merge_current_backspace {
+                self.resolve_backspace_batch(outcome, batch_started_at, current_backspace_count)?;
+                tracing::debug!(
+                    count = backspace_count,
+                    ?outcome,
+                    elapsed_us =
+                        u64::try_from(batch_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    "Processed Backspace conversion batch"
+                );
+            }
+            outcome.is_eaten()
         };
         log_mode_key_event(
             "key_down",
@@ -391,11 +514,6 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
             preserved_keys,
             result,
         );
-        if result && is_backspace(wparam) {
-            self.borrow_mut()?
-                .backspace_repeat_state
-                .mark_handled(Instant::now());
-        }
 
         Ok(result.into())
     }
@@ -404,19 +522,40 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
     fn OnTestKeyUp(
         &self,
         _pic: Option<&ITfContext>,
-        _wparam: WPARAM,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
-        // same as OnTestKeyDown
-        Ok(false.into())
+        let has_pending_backspaces =
+            is_backspace(wparam) && self.borrow()?.backspace_repeat_state.pending_count() != 0;
+        Ok(has_pending_backspaces.into())
     }
 
     #[macros::anyhow]
-    fn OnKeyUp(&self, _pic: Option<&ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        // this function is called when a key is released
-        // but we handle key events in OnKeyDown function
-        // so just return S_OK
-        Ok(false.into())
+    fn OnKeyUp(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        if !is_backspace(wparam) {
+            return Ok(false.into());
+        }
+
+        let count = self.borrow()?.backspace_repeat_state.pending_count();
+        if count == 0 {
+            return Ok(false.into());
+        }
+
+        // No later repeat exists to trigger the batch. Flush every retained deletion before the
+        // key is released, using one RemoveText RPC and one candidate conversion.
+        let batch_started_at = Instant::now();
+        let outcome = self.handle_key(pic, wparam, count, true)?;
+        self.resolve_backspace_batch(outcome, batch_started_at, 0)?;
+        tracing::debug!(
+            count,
+            ?outcome,
+            elapsed_us = u64::try_from(batch_started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "Flushed Backspace conversion batch on key-up"
+        );
+
+        // These key-down events were already claimed by the TIP, so never pass their matching
+        // key-up through even if cleanup made the composition disappear.
+        Ok(true.into())
     }
 
     #[macros::anyhow]
@@ -465,6 +604,16 @@ mod tests {
     }
 
     #[test]
+    fn reads_and_normalizes_the_key_message_repeat_count() {
+        assert_eq!(key_repeat_count(LPARAM(0)), 1);
+        assert_eq!(key_repeat_count(LPARAM(7)), 7);
+        assert_eq!(
+            key_repeat_count(LPARAM((PREVIOUS_KEY_STATE_BIT | 23) as isize)),
+            23
+        );
+    }
+
+    #[test]
     fn alt_context_comes_from_the_key_message() {
         assert!(!has_alt_context(LPARAM(0)));
         assert!(has_alt_context(LPARAM(ALT_CONTEXT_BIT as isize)));
@@ -476,6 +625,14 @@ mod tests {
         assert!(should_claim_pending_cleanup(true, true));
         assert!(!should_claim_pending_cleanup(true, false));
         assert!(!should_claim_pending_cleanup(false, true));
+    }
+
+    #[test]
+    fn later_key_is_claimed_to_preserve_deferred_backspace_order() {
+        assert!(should_claim_key_to_flush_backspaces(true, false, 2));
+        assert!(!should_claim_key_to_flush_backspaces(true, true, 2));
+        assert!(!should_claim_key_to_flush_backspaces(true, false, 0));
+        assert!(!should_claim_key_to_flush_backspaces(false, false, 2));
     }
 
     #[test]

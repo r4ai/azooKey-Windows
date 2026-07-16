@@ -26,7 +26,11 @@ message AppendTextResponse {
 }
 
 // Request message for RemoveText.
-message RemoveTextRequest {}
+message RemoveTextRequest {
+  // Number of composing-text surface characters to delete. Zero is treated as
+  // one for compatibility with clients generated from the old empty message.
+  uint32 count = 1;
+}
 
 // Response message for RemoveText.
 message RemoveTextResponse {

@@ -7,7 +7,7 @@ pub enum ClientAction {
     DiscardComposition,
 
     AppendText(String),
-    RemoveText,
+    RemoveText(u32),
     CommitPrefixAndAppend(String),
 
     SetTextWithType(SetTextType),
