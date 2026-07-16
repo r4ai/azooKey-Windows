@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use anyhow::Context as _;
 use azookey_server::TonicNamedPipeServer;
@@ -22,6 +22,7 @@ use windows::Win32::{
     Foundation::HWND,
     UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE},
 };
+use wry::WebContext;
 
 pub mod candidate;
 pub mod indicator;
@@ -39,6 +40,29 @@ const CANDIDATE_WINDOW_MIN_WIDTH: u32 = 225;
 const CANDIDATE_WINDOW_MAX_WIDTH: u32 = 720;
 const CANDIDATE_WINDOW_BASE_WIDTH: u32 = 120;
 const CANDIDATE_CHARACTER_WIDTH: u32 = 18;
+
+fn webview_data_directory_from_local_app_data(
+    local_app_data: Option<OsString>,
+) -> anyhow::Result<PathBuf> {
+    let local_app_data = local_app_data
+        .filter(|value| !value.is_empty())
+        .context("LOCALAPPDATA is unavailable for the WebView2 data directory")?;
+    Ok(PathBuf::from(local_app_data)
+        .join("Azookey")
+        .join("WebView2"))
+}
+
+fn create_webview_context() -> anyhow::Result<WebContext> {
+    let data_directory =
+        webview_data_directory_from_local_app_data(std::env::var_os("LOCALAPPDATA"))?;
+    std::fs::create_dir_all(&data_directory).with_context(|| {
+        format!(
+            "Failed to create the WebView2 data directory at {}",
+            data_directory.display()
+        )
+    })?;
+    Ok(WebContext::new(Some(data_directory)))
+}
 
 fn candidate_window_width(candidates: &[String]) -> u32 {
     let measured_character_limit = ((CANDIDATE_WINDOW_MAX_WIDTH - CANDIDATE_WINDOW_BASE_WIDTH)
@@ -86,10 +110,11 @@ async fn main() -> anyhow::Result<()> {
 
     let event_loop_proxy = event_loop.create_proxy();
     let task_guard: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let mut web_context = create_webview_context()?;
 
     let proxy_clone = event_loop_proxy.clone();
     let candidate_window = candidate::create_candidate_window(&event_loop)?;
-    let candidate_webview_builder = candidate::create_candidate_webview()?;
+    let candidate_webview_builder = candidate::create_candidate_webview(&mut web_context)?;
     let candidate_webview = candidate_webview_builder
         .with_devtools(true)
         .with_ipc_handler(move |message| {
@@ -109,7 +134,8 @@ async fn main() -> anyhow::Result<()> {
         .build(&candidate_window)?;
 
     let indicator_window = indicator::create_indicator_window(&event_loop)?;
-    let indicator_webview = indicator::create_indicator_webview(&indicator_window)?;
+    let indicator_webview =
+        indicator::create_indicator_webview(&indicator_window, &mut web_context)?;
 
     // handle window actions
     let proxy_clone = event_loop_proxy.clone();
@@ -126,6 +152,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut candidate_anchor = None;
     event_loop.run(move |event, _, control_flow| {
+        // Wry requires the shared context to outlive every WebView that uses it.
+        let _keep_web_context_alive = &web_context;
         *control_flow = ControlFlow::Wait;
 
         let indicator_hwnd = indicator_window.hwnd();
@@ -309,5 +337,24 @@ mod tests {
         let expected = (CANDIDATE_WINDOW_BASE_WIDTH + 10 * CANDIDATE_CHARACTER_WIDTH)
             .clamp(CANDIDATE_WINDOW_MIN_WIDTH, CANDIDATE_WINDOW_MAX_WIDTH);
         assert_eq!(candidate_window_width(&["あ".repeat(10)]), expected);
+    }
+
+    #[test]
+    fn webview_data_is_stored_outside_the_install_directory() {
+        let path = webview_data_directory_from_local_app_data(Some(OsString::from(
+            r"C:\Users\tester\AppData\Local",
+        )))
+        .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\Users\tester\AppData\Local\Azookey\WebView2")
+        );
+    }
+
+    #[test]
+    fn webview_data_requires_a_user_local_directory() {
+        assert!(webview_data_directory_from_local_app_data(None).is_err());
+        assert!(webview_data_directory_from_local_app_data(Some(OsString::new())).is_err());
     }
 }
