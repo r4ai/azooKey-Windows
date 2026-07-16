@@ -1,4 +1,5 @@
 import { Bot, Settings, Megaphone } from "lucide-react"
+import { Link, useLocation } from "react-router"
 
 import {
     Sidebar,
@@ -41,7 +42,7 @@ const footer = [
 ]
 
 export function AppSidebar() {
-    let currentPath = window.location.pathname;
+    const { pathname } = useLocation()
 
     return (
         <Sidebar>
@@ -51,12 +52,12 @@ export function AppSidebar() {
                     <SidebarGroupContent>
                         <SidebarMenu>
                             {contents.map((item) => (
-                                <SidebarMenuItem key={item.title} className={currentPath == item.url ? "[&>*]:bg-sidebar-accent" : ""}>
+                                <SidebarMenuItem key={item.title} className={pathname === item.url ? "[&>*]:bg-sidebar-accent" : ""}>
                                     <SidebarMenuButton asChild>
-                                        <a href={item.url}>
+                                        <Link to={item.url}>
                                             <item.icon />
                                             <span>{item.title}</span>
-                                        </a>
+                                        </Link>
                                     </SidebarMenuButton>
                                 </SidebarMenuItem>
                             ))}
@@ -69,12 +70,12 @@ export function AppSidebar() {
                     <SidebarGroupContent>
                         <SidebarMenu>
                             {footer.map((item) => (
-                                <SidebarMenuItem key={item.title} className={currentPath == item.url ? "[&>*]:bg-sidebar-accent" : ""}>
+                                <SidebarMenuItem key={item.title} className={pathname === item.url ? "[&>*]:bg-sidebar-accent" : ""}>
                                     <SidebarMenuButton asChild>
-                                        <a href={item.url}>
+                                        <Link to={item.url}>
                                             <item.icon />
                                             <span>{item.title}</span>
-                                        </a>
+                                        </Link>
                                     </SidebarMenuButton>
                                 </SidebarMenuItem>
                             ))}

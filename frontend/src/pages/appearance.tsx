@@ -65,14 +65,14 @@ export const Appearance = () => {
                 <div className="flex items-center space-x-4 rounded-md border p-4">
                     <FileCode />
                     <div className="flex-1 space-y-1">
-                        <p className="text-sm font-medium leading-none">
+                        <label htmlFor="custom-css" className="text-sm font-medium leading-none">
                             カスタムCSS
-                        </p>
+                        </label>
                         <p className="text-xs text-muted-foreground">
                             有効にした場合、上記の設定は無視されます
                         </p>
                     </div>
-                    <Switch />
+                    <Switch id="custom-css" />
                 </div>
             </section>
         </div>

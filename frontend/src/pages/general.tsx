@@ -13,9 +13,9 @@ export const General = () => {
                             v0.1.0-alpha.1
                         </p>
                     </div>
-                    <Button  variant="secondary">
-                        <a href="https://github.com/fkunn1326/azooKey-Windows/releases" className="flex items-center gap-x-2" target="_blank" rel="noopener noreferrer">
-                            <ExternalLink />
+                    <Button variant="secondary" asChild>
+                        <a href="https://github.com/fkunn1326/azooKey-Windows/releases" className="flex items-center gap-2" target="_blank" rel="noopener noreferrer">
+                            <ExternalLink data-icon="inline-start" />
                             更新を確認する
                         </a>
                     </Button>

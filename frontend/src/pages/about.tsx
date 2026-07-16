@@ -16,7 +16,7 @@ export const About = () => {
                             Azookey公式Discordサーバーに参加して、最新情報を入手する
                         </p>
                     </div>
-                    <Button variant="secondary">
+                    <Button variant="secondary" asChild>
                         <a href="https://discord.com/invite/dY9gHuyZN5" target="_blank" rel="noopener noreferrer">
                             参加する
                         </a>
