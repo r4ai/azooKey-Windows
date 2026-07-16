@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite"
 import { expect } from "storybook/test"
 import { withSettingsFrame } from "@/storybook/decorators"
-import { setTauriMock } from "@/storybook/tauri"
+import { resetTauriMock, setTauriMock } from "@/storybook/tauri"
 import { Zenzai } from "./zenzai"
 
 const disabledConfiguration = {
@@ -21,6 +21,7 @@ const meta = {
     route: "/zenzai",
   },
   loaders: [() => {
+    resetTauriMock()
     setTauriMock({ config: disabledConfiguration })
     return {}
   }],

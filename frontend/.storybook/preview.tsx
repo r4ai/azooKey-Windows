@@ -1,7 +1,6 @@
 import { withThemeByClassName } from "@storybook/addon-themes"
 import type { Preview, Renderer } from "@storybook/react-vite"
 import "../src/index.css"
-import { resetTauriMock } from "../src/storybook/tauri"
 
 const preview: Preview = {
   decorators: [
@@ -18,7 +17,6 @@ const preview: Preview = {
       </div>
     ),
   ],
-  beforeEach: resetTauriMock,
   parameters: {
     layout: "fullscreen",
     controls: {
