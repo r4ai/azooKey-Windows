@@ -1,5 +1,6 @@
 <html>
     <head>
+        <meta charset="utf-8">
         <style>
             body, html {
                 overscroll-behavior: none;
@@ -110,6 +111,11 @@
             }
         </style>
         <script>
+            let markCandidateUiReady;
+            window.azookeyCandidateUiReady = new Promise((resolve) => {
+                markCandidateUiReady = resolve;
+            });
+
             function updateCandidates(candidates) {
                 const candidateList = document.getElementById('candidate-list');
 
@@ -207,10 +213,12 @@
                 // Clear the test items
                 candidateList.innerHTML = '';
                 
-                window.ipc.postMessage(JSON.stringify({
+                const resizeMessage = JSON.stringify({
                     type: 'resize',
                     height: totalHeight
-                }));
+                });
+                window.ipc?.postMessage(resizeMessage);
+                markCandidateUiReady();
             }
 
             

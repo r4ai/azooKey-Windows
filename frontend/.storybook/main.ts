@@ -7,6 +7,12 @@ const dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const config: StorybookConfig = {
   stories: ["../src/**/*.stories.@(js|jsx|mjs|ts|tsx)"],
+  staticDirs: [
+    {
+      from: path.resolve(dirname, "../../crates/ui/assets"),
+      to: "/candidate-ui",
+    },
+  ],
   addons: [
     "@storybook/addon-docs",
     "@storybook/addon-a11y",
