@@ -142,7 +142,15 @@ impl UISentState {
             }
             UICommand::Position(value) => self.position = Some(value.value),
             UICommand::Selection(value) => self.selection = Some(value.value),
-            UICommand::Visibility(value) => self.visible = Some(value.value),
+            UICommand::Visibility(value) => {
+                self.visible = Some(value.value);
+                if !value.value {
+                    // The UI drops its anchor when it is hidden so a later composition cannot
+                    // briefly appear at this position. Force the next composition to send its
+                    // caret rectangle even when the coordinates happen to be identical.
+                    self.position = None;
+                }
+            }
             UICommand::InputMode(value) => self.input_mode = Some(value.value.clone()),
         }
     }
@@ -265,6 +273,11 @@ impl UIConnectionState {
     }
 
     fn set_visible(&mut self, visible: bool) {
+        if !visible {
+            // Positions are scoped to one composition. Retaining this value lets a new
+            // composition replay the previous caret rectangle before GetTextExt completes.
+            self.desired.position = None;
+        }
         if self.desired.visible.as_ref().map(|value| value.value) == Some(visible) {
             return;
         }
@@ -347,38 +360,42 @@ impl UIConnectionState {
         let mut commands = Vec::with_capacity(5);
         let hidden = self.desired.visible.as_ref().map(|value| value.value) == Some(false);
         let mut candidate_pending = false;
+        let mut position_ready = false;
         if !hidden {
-            if let Some(value) = self.desired.candidate.as_ref() {
-                let latest_selection = self.desired.selection.as_ref();
-                let effective = Stamped {
-                    sequence: value.sequence,
-                    value: CandidateState {
-                        candidates: Arc::clone(&value.value.candidates),
-                        selection: latest_selection
-                            .map_or(value.value.selection, |selection| selection.value),
-                    },
-                };
-                if self.sent.candidates.as_ref() != Some(&effective.value.candidates) {
-                    commands.push(UICommand::Candidate(effective));
-                    candidate_pending = true;
+            if let Some(value) = self.desired.position.as_ref() {
+                position_ready = self.sent.position == Some(value.value);
+                if !position_ready {
+                    commands.push(UICommand::Position(value.clone()));
                 }
             }
-            if !candidate_pending {
-                if let Some(value) = self.desired.position.as_ref() {
-                    if self.sent.position != Some(value.value) {
-                        commands.push(UICommand::Position(value.clone()));
+            if position_ready {
+                if let Some(value) = self.desired.candidate.as_ref() {
+                    let latest_selection = self.desired.selection.as_ref();
+                    let effective = Stamped {
+                        sequence: value.sequence,
+                        value: CandidateState {
+                            candidates: Arc::clone(&value.value.candidates),
+                            selection: latest_selection
+                                .map_or(value.value.selection, |selection| selection.value),
+                        },
+                    };
+                    if self.sent.candidates.as_ref() != Some(&effective.value.candidates) {
+                        commands.push(UICommand::Candidate(effective));
+                        candidate_pending = true;
                     }
                 }
-                if let Some(value) = self.desired.selection.as_ref() {
-                    if self.sent.selection != Some(value.value) {
-                        commands.push(UICommand::Selection(value.clone()));
+                if !candidate_pending {
+                    if let Some(value) = self.desired.selection.as_ref() {
+                        if self.sent.selection != Some(value.value) {
+                            commands.push(UICommand::Selection(value.clone()));
+                        }
                     }
                 }
             }
         }
         if !candidate_pending {
             if let Some(value) = self.desired.visible.as_ref() {
-                if self.sent.visible != Some(value.value) {
+                if self.sent.visible != Some(value.value) && (!value.value || position_ready) {
                     commands.push(UICommand::Visibility(value.clone()));
                 }
             }
@@ -1040,6 +1057,7 @@ mod tests {
         let now = Instant::now();
         let mut state = UIConnectionState::default();
         state.set_visible(true);
+        state.set_position((1, 2, 3, 4));
         let first = state.begin_reconnect(now).unwrap();
         assert!(!state.finish_reconnect(first, None));
 
@@ -1097,6 +1115,62 @@ mod tests {
     }
 
     #[test]
+    fn candidate_waits_until_the_first_caret_position_is_available() {
+        let mut state = UIConnectionState::default();
+        state.set_candidate_state(&["候補".to_owned()], 0);
+
+        assert!(
+            state.next_command().is_none(),
+            "showing candidates without an anchor exposes the UI at its default window position"
+        );
+    }
+
+    #[test]
+    fn caret_position_is_sent_before_candidates_on_initial_display() {
+        let mut state = UIConnectionState::default();
+        state.set_candidate_state(&["候補".to_owned()], 0);
+        state.set_position((10, 20, 30, 40));
+
+        assert!(matches!(
+            state.next_command(),
+            Some(UICommand::Position(Stamped {
+                value: (10, 20, 30, 40),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn hiding_candidates_forgets_the_previous_composition_position() {
+        let mut state = UIConnectionState::default();
+        state.set_position((10, 20, 30, 40));
+
+        state.set_visible(false);
+
+        assert!(
+            state.desired.position.is_none(),
+            "a new composition must not reuse the previous caret position"
+        );
+    }
+
+    #[test]
+    fn a_successful_hide_forces_an_identical_position_to_be_sent_again() {
+        let mut sent = UISentState {
+            visible: Some(true),
+            position: Some((10, 20, 30, 40)),
+            ..UISentState::default()
+        };
+
+        sent.note_success(&UICommand::Visibility(Stamped {
+            sequence: 2,
+            value: false,
+        }));
+
+        assert_eq!(sent.visible, Some(false));
+        assert!(sent.position.is_none());
+    }
+
+    #[test]
     fn hidden_desired_state_suppresses_stale_candidate_replay() {
         let mut state = UIConnectionState::default();
         state.set_candidate_state(&["候補".to_owned()], 0);
@@ -1115,6 +1189,10 @@ mod tests {
         let mut state = UIConnectionState::default();
         state.set_candidate_state(&["第一".to_owned(), "第二".to_owned()], 0);
         state.set_selection(1);
+        state.set_position((1, 2, 3, 4));
+
+        assert!(matches!(state.next_command(), Some(UICommand::Position(_))));
+        state.sent.position = Some((1, 2, 3, 4));
 
         let Some(UICommand::Candidate(candidate)) = state.next_command() else {
             panic!("candidate command was not queued");

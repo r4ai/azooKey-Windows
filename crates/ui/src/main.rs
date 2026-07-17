@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use azookey_server::TonicNamedPipeServer;
 use ipc::{WindowAction, WindowController, WindowService};
 use shared::proto::window_service_server::WindowServiceServer;
-use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::platform::windows::{EventLoopBuilderExtWindows, WindowExtWindows};
 use tao::{
     event::{Event, StartCause, WindowEvent},
@@ -82,6 +82,60 @@ fn candidate_window_width(candidates: &[String]) -> u32 {
     estimated.clamp(CANDIDATE_WINDOW_MIN_WIDTH, CANDIDATE_WINDOW_MAX_WIDTH)
 }
 
+#[derive(Debug)]
+struct CandidateWindowState {
+    width: u32,
+    content_height: Option<u32>,
+    anchor: Option<(i32, i32, i32, i32)>,
+    show_requested: bool,
+}
+
+impl CandidateWindowState {
+    fn new(width: u32) -> Self {
+        Self {
+            width,
+            content_height: None,
+            anchor: None,
+            show_requested: false,
+        }
+    }
+
+    fn set_width(&mut self, width: u32) {
+        self.width = width;
+    }
+
+    fn set_content_height(&mut self, height: u32) {
+        if height > 0 {
+            self.content_height = Some(height);
+        }
+    }
+
+    fn set_anchor(&mut self, anchor: (i32, i32, i32, i32)) {
+        self.anchor = Some(anchor);
+    }
+
+    fn anchor(&self) -> Option<(i32, i32, i32, i32)> {
+        self.anchor
+    }
+
+    fn logical_size(&self) -> Option<(u32, u32)> {
+        self.content_height.map(|height| (self.width, height))
+    }
+
+    fn request_show(&mut self) {
+        self.show_requested = true;
+    }
+
+    fn should_show(&self) -> bool {
+        self.show_requested && self.anchor.is_some() && self.content_height.is_some()
+    }
+
+    fn hide(&mut self) {
+        self.show_requested = false;
+        self.anchor = None;
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // obtain uiaccess token
@@ -150,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let mut candidate_anchor = None;
+    let mut candidate_state = CandidateWindowState::new(CANDIDATE_WINDOW_MIN_WIDTH);
     event_loop.run(move |event, _, control_flow| {
         // Wry requires the shared context to outlive every WebView that uses it.
         let _keep_web_context_alive = &web_context;
@@ -202,6 +256,19 @@ async fn main() -> anyhow::Result<()> {
             indicator_window
                 .set_outer_position(PhysicalPosition::new((left - 45) as f64, bottom as f64));
         };
+        let apply_candidate_state = |state: &CandidateWindowState| {
+            let Some((width, height)) = state.logical_size() else {
+                return;
+            };
+
+            candidate_window.set_inner_size(LogicalSize::new(width, height));
+            if let Some((top, left, bottom, right)) = state.anchor() {
+                position_windows(top, left, bottom, right);
+            }
+            if state.should_show() {
+                show_candidate_window();
+            }
+        };
 
         match event {
             Event::NewEvents(StartCause::Init) => {}
@@ -211,14 +278,18 @@ async fn main() -> anyhow::Result<()> {
             } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(script) => match script {
                 UserEvent::UpdateHeight(height) => {
-                    let width = candidate_window.inner_size().width as i32;
-                    candidate_window.set_inner_size(LogicalSize::new(width, height));
+                    if let Ok(height) = u32::try_from(height) {
+                        candidate_state.set_content_height(height);
+                        apply_candidate_state(&candidate_state);
+                    }
                 }
                 UserEvent::WindowAction(action) => match action {
                     WindowAction::Show => {
-                        show_candidate_window();
+                        candidate_state.request_show();
+                        apply_candidate_state(&candidate_state);
                     }
                     WindowAction::Hide => {
+                        candidate_state.hide();
                         let _ = unsafe {
                             ShowWindow(
                                 HWND(candidate_window.hwnd() as *mut std::ffi::c_void),
@@ -232,18 +303,12 @@ async fn main() -> anyhow::Result<()> {
                         bottom,
                         right,
                     } => {
-                        candidate_anchor = Some((top, left, bottom, right));
-                        position_windows(top, left, bottom, right);
+                        candidate_state.set_anchor((top, left, bottom, right));
+                        apply_candidate_state(&candidate_state);
                     }
                     WindowAction::SetCandidate { candidates } => {
-                        let height = candidate_window.inner_size().height as i32;
-                        candidate_window.set_inner_size(PhysicalSize::new(
-                            candidate_window_width(&candidates),
-                            height as u32,
-                        ));
-                        if let Some((top, left, bottom, right)) = candidate_anchor {
-                            position_windows(top, left, bottom, right);
-                        }
+                        candidate_state.set_width(candidate_window_width(&candidates));
+                        apply_candidate_state(&candidate_state);
 
                         let candidates = serde_json::to_string(&candidates)
                             .context("Failed to serialize candidates")
@@ -256,15 +321,8 @@ async fn main() -> anyhow::Result<()> {
                         candidates,
                         selection,
                     } => {
-                        show_candidate_window();
-                        let height = candidate_window.inner_size().height as i32;
-                        candidate_window.set_inner_size(PhysicalSize::new(
-                            candidate_window_width(&candidates),
-                            height as u32,
-                        ));
-                        if let Some((top, left, bottom, right)) = candidate_anchor {
-                            position_windows(top, left, bottom, right);
-                        }
+                        candidate_state.set_width(candidate_window_width(&candidates));
+                        apply_candidate_state(&candidate_state);
 
                         let candidates = serde_json::to_string(&candidates)
                             .context("Failed to serialize candidates")
@@ -274,6 +332,8 @@ async fn main() -> anyhow::Result<()> {
                                 "updateCandidateState({candidates}, {selection})"
                             ))
                             .unwrap();
+                        candidate_state.request_show();
+                        apply_candidate_state(&candidate_state);
                     }
                     WindowAction::SetSelection { index } => {
                         candidate_webview
@@ -337,6 +397,52 @@ mod tests {
         let expected = (CANDIDATE_WINDOW_BASE_WIDTH + 10 * CANDIDATE_CHARACTER_WIDTH)
             .clamp(CANDIDATE_WINDOW_MIN_WIDTH, CANDIDATE_WINDOW_MAX_WIDTH);
         assert_eq!(candidate_window_width(&["あ".repeat(10)]), expected);
+    }
+
+    #[test]
+    fn initial_show_waits_for_both_caret_position_and_webview_height() {
+        let mut state = CandidateWindowState::new(CANDIDATE_WINDOW_MIN_WIDTH);
+
+        state.request_show();
+        assert!(!state.should_show());
+
+        state.set_anchor((100, 200, 120, 220));
+        assert!(!state.should_show());
+
+        state.set_content_height(180);
+        assert!(state.should_show());
+        assert_eq!(
+            state.logical_size(),
+            Some((CANDIDATE_WINDOW_MIN_WIDTH, 180))
+        );
+    }
+
+    #[test]
+    fn hiding_the_window_drops_only_the_composition_scoped_anchor() {
+        let mut state = CandidateWindowState::new(CANDIDATE_WINDOW_MIN_WIDTH);
+        state.set_content_height(180);
+        state.set_anchor((100, 200, 120, 220));
+        state.request_show();
+        assert!(state.should_show());
+
+        state.hide();
+        state.request_show();
+
+        assert!(!state.should_show());
+        assert!(state.anchor().is_none());
+        assert_eq!(
+            state.logical_size(),
+            Some((CANDIDATE_WINDOW_MIN_WIDTH, 180))
+        );
+    }
+
+    #[test]
+    fn measured_height_and_candidate_width_share_logical_pixel_units() {
+        let mut state = CandidateWindowState::new(CANDIDATE_WINDOW_MIN_WIDTH);
+        state.set_content_height(180);
+        state.set_width(360);
+
+        assert_eq!(state.logical_size(), Some((360, 180)));
     }
 
     #[test]
