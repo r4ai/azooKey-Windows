@@ -787,6 +787,9 @@ impl TextServiceFactory {
                     self.start_composition()?;
                     progress.started_composition = true;
                     abort_if_reentered!();
+                    if let Some(ipc_service) = ipc_service.as_mut() {
+                        ipc_service.invalidate_window_position();
+                    }
                     self.update_pos()?;
                     abort_if_reentered!();
                 }

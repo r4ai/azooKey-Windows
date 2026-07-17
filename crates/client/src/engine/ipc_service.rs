@@ -299,6 +299,10 @@ impl UIConnectionState {
         });
     }
 
+    fn invalidate_position(&mut self) {
+        self.desired.position = None;
+    }
+
     fn set_candidate_state(&mut self, candidates: &[String], selection: i32) {
         let unchanged = self.desired.candidate.as_ref().is_some_and(|value| {
             value.value.selection == selection
@@ -349,6 +353,9 @@ impl UIConnectionState {
         {
             return;
         }
+        // An input-mode indicator is meaningful only at the caret that was current when the
+        // mode changed. Drop any composition-scoped rectangle and wait for a fresh TSF read.
+        self.desired.position = None;
         let sequence = self.next_sequence();
         self.desired.input_mode = Some(Stamped {
             sequence,
@@ -359,15 +366,28 @@ impl UIConnectionState {
     fn next_command(&self) -> Option<UICommand> {
         let mut commands = Vec::with_capacity(5);
         let hidden = self.desired.visible.as_ref().map(|value| value.value) == Some(false);
+        let input_mode_pending = self
+            .desired
+            .input_mode
+            .as_ref()
+            .is_some_and(|value| self.sent.input_mode.as_deref() != Some(value.value.as_str()));
         let mut candidate_pending = false;
-        let mut position_ready = false;
-        if !hidden {
-            if let Some(value) = self.desired.position.as_ref() {
-                position_ready = self.sent.position == Some(value.value);
-                if !position_ready {
-                    commands.push(UICommand::Position(value.clone()));
-                }
+        let position_ready = self
+            .desired
+            .position
+            .as_ref()
+            .is_some_and(|value| self.sent.position == Some(value.value));
+        if !hidden || input_mode_pending {
+            if let Some(value) = self
+                .desired
+                .position
+                .as_ref()
+                .filter(|value| self.sent.position != Some(value.value))
+            {
+                commands.push(UICommand::Position(value.clone()));
             }
+        }
+        if !hidden {
             if position_ready {
                 if let Some(value) = self.desired.candidate.as_ref() {
                     let latest_selection = self.desired.selection.as_ref();
@@ -401,7 +421,7 @@ impl UIConnectionState {
             }
         }
         if let Some(value) = self.desired.input_mode.as_ref() {
-            if self.sent.input_mode.as_deref() != Some(value.value.as_str()) {
+            if input_mode_pending && position_ready {
                 commands.push(UICommand::InputMode(value.clone()));
             }
         }
@@ -953,6 +973,13 @@ impl IPCService {
         Ok(())
     }
 
+    pub fn invalidate_window_position(&mut self) {
+        if !self.identity.is_active() {
+            return;
+        }
+        lock_or_recover(&self.ui_connection).invalidate_position();
+    }
+
     #[tracing::instrument(skip(self, candidates))]
     pub fn set_candidate_state(&mut self, candidates: &[String], selection: i32) -> Result<()> {
         if !self.identity.is_active() {
@@ -1216,6 +1243,70 @@ mod tests {
     }
 
     #[test]
+    fn input_mode_waits_for_a_fresh_caret_position() {
+        let mut state = UIConnectionState::default();
+        state.set_position((1, 2, 3, 4));
+        state.sent.position = Some((1, 2, 3, 4));
+
+        state.set_input_mode("あ");
+
+        assert!(state.desired.position.is_none());
+        assert!(state.next_command().is_none());
+    }
+
+    #[test]
+    fn fresh_caret_position_is_sent_before_input_mode_indicator() {
+        let mut state = UIConnectionState::default();
+        state.set_input_mode("あ");
+        state.set_position((10, 20, 30, 40));
+
+        assert!(matches!(
+            state.next_command(),
+            Some(UICommand::Position(Stamped {
+                value: (10, 20, 30, 40),
+                ..
+            }))
+        ));
+
+        state.sent.position = Some((10, 20, 30, 40));
+        assert!(matches!(
+            state.next_command(),
+            Some(UICommand::InputMode(Stamped { ref value, .. })) if value == "あ"
+        ));
+    }
+
+    #[test]
+    fn hidden_candidates_do_not_block_indicator_position_updates() {
+        let mut state = UIConnectionState::default();
+        state.set_visible(false);
+        state.sent.visible = Some(false);
+        state.set_input_mode("A");
+        state.set_position((10, 20, 30, 40));
+
+        assert!(matches!(
+            state.next_command(),
+            Some(UICommand::Position(Stamped {
+                value: (10, 20, 30, 40),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn candidate_does_not_reuse_an_indicator_position_from_before_composition() {
+        let mut state = UIConnectionState::default();
+        state.set_input_mode("あ");
+        state.set_position((10, 20, 30, 40));
+        state.sent.position = Some((10, 20, 30, 40));
+        state.sent.input_mode = Some("あ".to_owned());
+
+        state.invalidate_position();
+        state.set_candidate_state(&["候補".to_owned()], 0);
+
+        assert!(state.next_command().is_none());
+    }
+
+    #[test]
     fn reconnect_clears_sent_state_but_preserves_desired_state() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _entered = runtime.enter();
@@ -1232,6 +1323,11 @@ mod tests {
 
         assert!(state.finish_reconnect(attempt, Some(channel)));
         assert!(state.sent.input_mode.is_none());
+        assert!(state.next_command().is_none());
+
+        state.set_position((1, 2, 3, 4));
+        assert!(matches!(state.next_command(), Some(UICommand::Position(_))));
+        state.sent.position = Some((1, 2, 3, 4));
         assert!(matches!(
             state.next_command(),
             Some(UICommand::InputMode(_))

@@ -360,6 +360,9 @@ impl TextServiceFactory {
             if let Err(error) = ipc_service.set_input_mode(mode.indicator()) {
                 tracing::warn!("Failed to update candidate UI input mode: {error:?}");
             }
+            if let Err(error) = self.update_indicator_pos() {
+                tracing::warn!("Failed to update input-mode indicator position: {error:?}");
+            }
         }
 
         Ok(())

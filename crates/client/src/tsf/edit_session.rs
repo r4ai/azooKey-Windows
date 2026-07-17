@@ -6,9 +6,9 @@ use windows::{
         UI::TextServices::{
             ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
             ITfEditSession_Impl, ITfInsertAtSelection, ITfRange, ITfTextInputProcessor,
-            GUID_PROP_ATTRIBUTE, TF_AE_NONE, TF_ANCHOR_END, TF_ANCHOR_START, TF_ES_ASYNC,
-            TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
-            TF_SELECTIONSTYLE, TF_ST_CORRECTION,
+            GUID_PROP_ATTRIBUTE, TF_AE_NONE, TF_AE_START, TF_ANCHOR_END, TF_ANCHOR_START,
+            TF_DEFAULT_SELECTION, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
+            TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE, TF_ST_CORRECTION,
         },
     },
 };
@@ -100,6 +100,65 @@ fn async_read_edit_session(
     Ok(())
 }
 
+fn current_text_ext(
+    context: &ITfContext,
+    tip_composition: Option<&ITfComposition>,
+    cookie: u32,
+) -> Result<Option<RECT>> {
+    unsafe {
+        let range = if let Some(tip_composition) = tip_composition {
+            tip_composition.GetRange()?
+        } else {
+            let mut selections = [TF_SELECTION::default()];
+            let mut fetched = 0;
+            context.GetSelection(cookie, TF_DEFAULT_SELECTION, &mut selections, &mut fetched)?;
+            if fetched == 0 {
+                return Ok(None);
+            }
+
+            let Some(range) = selections[0].range.as_ref() else {
+                return Ok(None);
+            };
+            let range = range.Clone()?;
+            let anchor = if selections[0].style.ase == TF_AE_START {
+                TF_ANCHOR_START
+            } else {
+                TF_ANCHOR_END
+            };
+            range.Collapse(cookie, anchor)?;
+            range
+        };
+
+        let view = context.GetActiveView()?;
+        let mut rect = RECT::default();
+        let mut clipped = false.into();
+        view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
+        Ok(Some(rect))
+    }
+}
+
+struct DetachedPositionSession;
+
+impl DetachedPositionSession {
+    fn new() -> Result<Self> {
+        DllModule::get()?.add_ref();
+        Ok(Self)
+    }
+}
+
+impl Drop for DetachedPositionSession {
+    fn drop(&mut self) {
+        match DllModule::get() {
+            Ok(mut dll_instance) => {
+                dll_instance.release();
+            }
+            Err(error) => {
+                tracing::warn!("Failed to release DLL reference for indicator position: {error:?}");
+            }
+        }
+    }
+}
+
 struct UpdatePosCompletion {
     owner: ITfTextInputProcessor,
     pending: Cell<bool>,
@@ -176,6 +235,36 @@ impl<'a, T> ITfEditSession_Impl for EditSession_Impl<'a, T> {
 }
 
 impl TextServiceFactory {
+    #[tracing::instrument]
+    pub fn update_indicator_pos(&self) -> Result<()> {
+        let (tid, context, tip_composition) = {
+            let text_service = self.borrow()?;
+            let composition = text_service.borrow_composition()?;
+            (
+                text_service.tid,
+                text_service.context::<ITfContext>()?,
+                composition.tip_composition.clone(),
+            )
+        };
+        let lifetime = Rc::new(DetachedPositionSession::new()?);
+
+        async_read_edit_session(
+            tid,
+            context.clone(),
+            Rc::new(move |cookie| {
+                let _keep_dll_loaded = &lifetime;
+                let Some(rect) = current_text_ext(&context, tip_composition.as_ref(), cookie)?
+                else {
+                    return Ok(());
+                };
+                let Some(mut ipc_service) = IMEState::ipc_snapshot() else {
+                    return Ok(());
+                };
+                ipc_service.set_window_position(rect.top, rect.left, rect.bottom, rect.right)
+            }),
+        )
+    }
+
     #[tracing::instrument]
     pub fn start_composition(&self) -> Result<()> {
         tracing::debug!("start_composition");
@@ -445,17 +534,15 @@ impl TextServiceFactory {
                         let completion = Rc::clone(&completion);
 
                         move |cookie| {
-                            let result: Result<()> = (|| unsafe {
-                                let view = context.GetActiveView()?;
-                                let range = tip_composition.GetRange()?;
-
+                            let result: Result<()> = (|| {
                                 let Some(mut ipc_service) = IMEState::ipc_snapshot() else {
                                     return Ok(());
                                 };
-
-                                let mut rect = RECT::default();
-                                let mut clipped = false.into();
-                                view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
+                                let Some(rect) =
+                                    current_text_ext(&context, Some(&tip_composition), cookie)?
+                                else {
+                                    return Ok(());
+                                };
 
                                 ipc_service.set_window_position(
                                     rect.top,

@@ -21,7 +21,7 @@ pub fn create_indicator_window(event_loop: &EventLoop<UserEvent>) -> Result<Wind
         .with_decorations(false)
         .with_title("Indicator")
         .with_focused(false)
-        // .with_visible(false)
+        .with_visible(false)
         .with_undecorated_shadow(false)
         .with_transparent(true)
         .build(&event_loop)

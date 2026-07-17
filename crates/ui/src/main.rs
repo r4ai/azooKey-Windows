@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
                 )
             };
         };
-        let position_windows = |top, left, bottom, right| {
+        let position_candidate_window = |top, left, bottom, right| {
             let (x, y) = get_candidate_window_position(top, left, bottom, right, &candidate_window);
 
             unsafe {
@@ -241,7 +241,11 @@ async fn main() -> anyhow::Result<()> {
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 );
-
+            }
+            candidate_window.set_outer_position(PhysicalPosition::new(x, y));
+        };
+        let position_indicator_window = |left, bottom| {
+            unsafe {
                 let _ = SetWindowPos(
                     HWND(indicator_hwnd as *mut std::ffi::c_void),
                     HWND_TOPMOST,
@@ -252,10 +256,10 @@ async fn main() -> anyhow::Result<()> {
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 );
             }
-            candidate_window.set_outer_position(PhysicalPosition::new(x, y));
             indicator_window
                 .set_outer_position(PhysicalPosition::new((left - 45) as f64, bottom as f64));
         };
+
         let apply_candidate_state = |state: &CandidateWindowState| {
             let Some((width, height)) = state.logical_size() else {
                 return;
@@ -263,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
 
             candidate_window.set_inner_size(LogicalSize::new(width, height));
             if let Some((top, left, bottom, right)) = state.anchor() {
-                position_windows(top, left, bottom, right);
+                position_candidate_window(top, left, bottom, right);
             }
             if state.should_show() {
                 show_candidate_window();
@@ -304,6 +308,7 @@ async fn main() -> anyhow::Result<()> {
                         right,
                     } => {
                         candidate_state.set_anchor((top, left, bottom, right));
+                        position_indicator_window(left, bottom);
                         apply_candidate_state(&candidate_state);
                     }
                     WindowAction::SetCandidate { candidates } => {
